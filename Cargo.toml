@@ -1,0 +1,9 @@
+[package]
+name = "mandelbrot"
+version = "0.1.0"
+authors = ["grubertw <grubertw@gmail.com>"]
+
+[dependencies]
+glium="0.16.0"
+log="0.3.0"
+time="0.1.0"
