@@ -1,264 +1,271 @@
-#[macro_use] extern crate glium;
-#[macro_use] extern crate log;
+mod controls;
+mod scene;
 
-mod logger;
+use controls::Controls;
+use scene::Scene;
 
-use glium::{DisplayBuild, Surface};
-use glium::glutin::{Event, VirtualKeyCode, MouseScrollDelta, ElementState, MouseButton, WindowBuilder};
-use MouseScrollDelta::LineDelta;
+use iced_wgpu::{wgpu, Backend, Renderer, Settings, Viewport};
+use iced_winit::{
+    conversion, futures, program, renderer, winit, Clipboard, Color, Debug,
+    Size,
+};
 
-#[derive(Copy, Clone)]
-struct Vertex {
-    position: [f32; 2],
-}
+use winit::{
+    dpi::PhysicalPosition,
+    event::{Event, ModifiersState, WindowEvent, MouseScrollDelta, ElementState, MouseButton},
+    event_loop::{ControlFlow, EventLoop},
+};
 
-implement_vertex!(Vertex, position);
+pub fn main() {
+    // Initialize winit
+    let event_loop = EventLoop::new();
+    let window = winit::window::Window::new(&event_loop).unwrap();
+    window.set_inner_size(winit::dpi::PhysicalSize::new(1200, 800));
 
-fn main() {
-    let logger_rc = logger::init();
-    assert_eq!(logger_rc.is_ok(), true);
+    let physical_size = window.inner_size();
+    let mut viewport = Viewport::with_physical_size(
+        Size::new(physical_size.width, physical_size.height),
+        window.scale_factor(),
+    );
+    let mut cursor_position = PhysicalPosition::new(-1.0, -1.0);
+    let mut modifiers = ModifiersState::default();
+    let mut clipboard = Clipboard::connect(&window);
 
-    // Initial window size, which may be changed by the user.
-    let mut window_size: (u32, u32) = (800, 800);
-    // inital maxmimum number of iterations (orbits)
-    let mut max_iterations: u32 = 100;
-    // Interval to increase max_iterations
-    let mut iteration_interval: u32 = 1;
-    // inital scale
-    let mut scale: f64 = 1.0;
-    // Interval to increase the scale
-    let mut scale_interval: f64 = 1.05;
-    // start x and y offsets at 0. mouse drags will increase/
-    // decrease these values.
-    let mut offset: (f64,f64) = (0.0,0.0);
-    let mut prev_pos: (i32,i32) = (-1,-1);
-    // frequency adjustment for color sine waves
-    let mut red_freq: f32 = 1.0;
-    let mut blue_freq: f32 = 1.0;
-    let mut green_freq: f32 = 1.0;
-    // phase adjustment for color sine waves
-    let mut red_phase: f32 = 0.0;
-    let mut blue_phase: f32 = 0.0; // alt 2.0
-    let mut green_phase: f32 = 0.0; // alt 4.0
-    // for tracking mouse up/down state.
+    // Initialize wgpu
+    let default_backend = wgpu::Backends::PRIMARY;
+    let backend = wgpu::util::backend_bits_from_env().unwrap_or(default_backend);
+    let instance = wgpu::Instance::new(backend);
+    let surface = unsafe { instance.create_surface(&window) };
+
+    let (format, (device, queue)) = futures::executor::block_on(async {
+        let adapter = wgpu::util::initialize_adapter_from_env_or_default(
+            &instance, backend, Some(&surface),
+        )
+        .await
+        .expect("No suitable GPU adapters found on the system!");
+
+        (
+            surface
+                .get_supported_formats(&adapter)
+                .first()
+                .copied()
+                .expect("Get preferred format"),
+            adapter
+                .request_device(
+                    &wgpu::DeviceDescriptor {
+                        label: None,
+                        features: adapter.features() & wgpu::Features::default(),
+                        limits: wgpu::Limits::default(),
+                    },
+                    None,
+                )
+                .await
+                .expect("Request device"),
+        )
+    });
+
+    surface.configure(
+        &device, &wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format,
+            width: physical_size.width, height: physical_size.height,
+            present_mode: wgpu::PresentMode::AutoVsync,
+        },
+    );
+
+    let mut resized = false;
+
+    // Initialize staging belt
+    let mut staging_belt = wgpu::util::StagingBelt::new(5 * 1024);
+
+    // Initialize scene and GUI controls
+    let mut scene = Scene::new(&device, format);
+    let controls = Controls::new();
+
+    // Initialize iced
+    let mut debug = Debug::new();
+    let mut renderer = Renderer::new(Backend::new(&device, Settings::default(), format));
+
+    let mut gui_state = program::State::new(
+        controls, viewport.logical_size(), &mut renderer, &mut debug,
+    );
+
+    // For tracking mouse movment and shifting (offsetting) the fractal
+    let mut prev_pos: (f64, f64) = (-1.0, -1.0);
     let mut mouse_state = ElementState::Released;
 
-    // Create the window
-    let display = WindowBuilder::new()
-        .with_title("Mandelbrot Set".to_string())
-        .with_dimensions(window_size.0, window_size.1)
-        .build_glium()
-        .unwrap();
+    // Run event loop
+    event_loop.run(move |event, _, control_flow| {
+        // You should change this if you want to render continuosly
+        *control_flow = ControlFlow::Wait;
 
-    // Compile the shaders
-    let program = glium::Program::from_source(
-        &display,
-        include_str!("mandelbrot.glslv"),
-        include_str!("mandelbrot.glslf"),
-        None).unwrap();
+        match event {
+            Event::WindowEvent { event, .. } => {
+                match event {
+                    WindowEvent::CursorMoved { position, .. } => {
+                        cursor_position = position;
 
-    // Render 2 triangles covering the whole screen
-    let vertices = [
-        // Top-left corner
-        Vertex{ position: [-1.0,  1.0] },
-        Vertex{ position: [ 1.0,  1.0] },
-        Vertex{ position: [-1.0, -1.0] },
+                        match mouse_state {
+                            ElementState::Pressed => {
+                                if prev_pos.0 > 0.0 {
+                                    let h = window.inner_size().height;
 
-        // Bottom-right corner
-        Vertex { position: [-1.0, -1.0] },
-        Vertex { position: [ 1.0,  1.0] },
-        Vertex { position: [ 1.0, -1.0] },
-    ];
+                                    let diff_x = (position.x - prev_pos.0) / h as f64;
+                                    let diff_y = (position.y - prev_pos.1) / h as f64;
 
-    let vertex_buffer = glium::VertexBuffer::new(&display, &vertices).unwrap();
+                                    let curr_offset = scene.offset();
+                                    scene.set_offset(
+                                        curr_offset.0 - diff_x as f32 * scene.scale(),
+                                        curr_offset.1 + diff_y as f32 * scene.scale()
+                                    )
+                                }
 
-    loop {
-        let mut target = display.draw();
-        // Draw the vertices
-        target.draw(&vertex_buffer,
-                    &glium::index::NoIndices(glium::index::PrimitiveType::TrianglesList),
-                    &program,
-                    &uniform! {max_iterations: max_iterations, 
-                               window_height: window_size.1,
-                               scale: scale,
-                               offset_x: offset.0,
-                               offset_y: offset.1,
-                               red_freq: red_freq,
-                               blue_freq: blue_freq,
-                               green_freq: green_freq,
-                               red_phase: red_phase,
-                               blue_phase: blue_phase,
-                               green_phase: green_phase},
-                    &Default::default()).unwrap();
-        target.finish().unwrap();
-
-        for event in display.poll_events() {
-            match event {
-                // the window has been closed by the user:
-                Event::Closed => return,
-                // Quit on Esc:
-                Event::KeyboardInput(_ , _, Some(VirtualKeyCode::Escape)) => return,
-                // Window was resized.
-                Event::Resized(w,h) => {window_size.0 = w; window_size.1 = h;},
-
-                // - key decrements max_iterations
-                Event::KeyboardInput(_,_, Some(VirtualKeyCode::Minus)) => {
-                    if max_iterations > iteration_interval {
-                        max_iterations -= iteration_interval;
-                    }
-                    else if iteration_interval > 2 {
-                        iteration_interval -= 1;
-                    }
-                    info!("max_iterations decremented to {}", max_iterations);
-                },
-                // = key increments max_iterations
-                Event::KeyboardInput(_,_, Some(VirtualKeyCode::Equals)) => {
-                    max_iterations += iteration_interval;
-                    info!("max_iterations incremented to {}", max_iterations);
-                },
-                // // i key increments the iteration_interval
-                // Event::KeyboardInput(_,_, Some(VirtualKeyCode::I)) => {
-                //     iteration_interval += 1;
-                //     info!("iteration_interval incremented to {}", iteration_interval);
-                // },
-                // // u key decrements the iteration_interval
-                // Event::KeyboardInput(_,_, Some(VirtualKeyCode::U)) => {
-                //     if iteration_interval > 1 {
-                //         iteration_interval -= 1;
-                //     }
-                //     info!("iteration_interval decremented to {}", iteration_interval);
-                // },
-                // s key increments the scale_interval
-                Event::KeyboardInput(_,_, Some(VirtualKeyCode::S)) => {
-                    scale_interval += 0.01;
-                    info!("scale_interval incremented to {}", scale_interval);
-                },
-                // a key decrements the scale_interval
-                Event::KeyboardInput(_,_, Some(VirtualKeyCode::A)) => {
-                    if scale_interval > 1.05 {
-                        scale_interval -= 0.01;
-                    }
-                    info!("scale_interval decremented to {}", scale_interval);
-                },
-                // r key increments the red frequency
-                Event::KeyboardInput(_,_, Some(VirtualKeyCode::R)) => {
-                    red_freq += 0.01;
-                    info!("red_freq incremented to {}", red_freq);
-                },
-                // e key decrements the red frequency 
-                Event::KeyboardInput(_,_, Some(VirtualKeyCode::E)) => {
-                    if red_freq > 0.0 {
-                        red_freq -= 0.01;
-                    }
-                    info!("red_freq decremented to {}", red_freq);
-                },
-                // g key increments the green frequency
-                Event::KeyboardInput(_,_, Some(VirtualKeyCode::G)) => {
-                    green_freq += 0.01;
-                    info!("green_freq incremented to {}", green_freq);
-                },
-                // f key decrements the green frequency 
-                Event::KeyboardInput(_,_, Some(VirtualKeyCode::F)) => {
-                    if green_freq > 0.0 {
-                        green_freq -= 0.01;
-                    }
-                    info!("green_freq decremented to {}", green_freq);
-                },
-                // b key increments the blue frequency
-                Event::KeyboardInput(_,_, Some(VirtualKeyCode::B)) => {
-                    blue_freq += 0.01;
-                    info!("red_freq incremented to {}", blue_freq);
-                },
-                // v key decrements the blue frequency 
-                Event::KeyboardInput(_,_, Some(VirtualKeyCode::V)) => {
-                    if blue_freq > 0.0 {
-                        blue_freq -= 0.01;
-                    }
-                    info!("blue_freq decremented to {}", blue_freq);
-                },
-                // y key increments the red phase
-                Event::KeyboardInput(_,_, Some(VirtualKeyCode::Y)) => {
-                    red_phase += 0.1;
-                    info!("red_phase incremented to {}", red_phase);
-                },
-                // t key decrements the red phase
-                Event::KeyboardInput(_,_, Some(VirtualKeyCode::T)) => {
-                    red_phase -= 0.1;
-                    info!("red_phase decremented to {}", red_phase);
-                },
-                // j key increments the green phase
-                Event::KeyboardInput(_,_, Some(VirtualKeyCode::J)) => {
-                    green_phase += 0.01;
-                    info!("green_phase incremented to {}", green_phase);
-                },
-                // h key decrements the green phase
-                Event::KeyboardInput(_,_, Some(VirtualKeyCode::H)) => {
-                    green_phase -= 0.1;
-                    info!("green_phase decremented to {}", green_phase);
-                },
-                // m key increments the blue phase
-                Event::KeyboardInput(_,_, Some(VirtualKeyCode::M)) => {
-                    blue_phase += 0.1;
-                    info!("blue_phase incremented to {}", blue_phase);
-                },
-                // n key decrements the blue phase
-                Event::KeyboardInput(_,_, Some(VirtualKeyCode::N)) => {
-                    blue_phase -= 0.1;
-                    info!("blue_phase decremented to {}", blue_phase);
-                },
-
-                // Zoom in and out with the mouse wheel.
-                Event::MouseWheel(delta, _) => {
-                    match delta {
-                        LineDelta(_, h) => {
-                            if h > 0.0 {
-                                scale /= scale_interval;
-                                info!("scale decremented to {}", scale);
+                                prev_pos.0 = position.x;
+                                prev_pos.1 = position.y;
                             }
-                            else if h < 0.0 {
-                                scale *= scale_interval;
-                                info!("scale incremented to {}", scale);
+                            ElementState::Released => {
+                                prev_pos = (-1.0, -1.0);
                             }
-                        },
-                        _ => ()
-                    }
-                },
-
-                // shift the drawing by clicking with the left mouse
-                // button and dragging.
-                Event::MouseInput(m_state, m_button) => {
-                    match m_button {
-                        MouseButton::Left => {
-                            mouse_state = m_state;
-                        }
-                        _ => ()
-                    }
-                },
-                Event::MouseMoved(curr_x, curr_y) => {
-                    match mouse_state {
-                        ElementState::Pressed => {
-                            if prev_pos.0 >= 0 {
-                                let diff_x = curr_x - prev_pos.0;
-                                let diff_y = curr_y - prev_pos.1;
-
-                                offset.0 -= (diff_x as f64) * scale;
-                                offset.1 += (diff_y as f64) * scale;
-
-                                info!("offset shifted ({},{})", offset.0, offset.1);
-                            }
-
-                            prev_pos.0 = curr_x;
-                            prev_pos.1 = curr_y;
-                        },
-                        ElementState::Released => {
-                            prev_pos = (-1,-1);
                         }
                     }
-                },
+                    WindowEvent::ModifiersChanged(new_modifiers) => {
+                        modifiers = new_modifiers;
+                    }
+                    WindowEvent::Resized(new_size) => {
+                        viewport = Viewport::with_physical_size(
+                            Size::new(new_size.width, new_size.height),
+                            window.scale_factor(),
+                        );
 
-                // Keep going on all other events.
-                _ => ()
+                        resized = true;
+                    }
+                    WindowEvent::MouseWheel { delta, .. } => {
+                        match delta {
+                            MouseScrollDelta::LineDelta(_, h) => {
+                                if h > 0.0 {
+                                    scene.set_scale(scene.scale() / 1.05);
+                                }
+                                else if h < 0.0 {
+                                    scene.set_scale(scene.scale() * 1.05);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    WindowEvent::MouseInput { state, button, ..} => {
+                        match button {
+                            MouseButton::Right => {
+                                mouse_state = state;
+                            }
+                            _ => {}
+                        }
+                    }
+                    WindowEvent::CloseRequested => {
+                        *control_flow = ControlFlow::Exit;
+                    }
+                    _ => {}
+                }
+
+                // Map window event to iced event
+                if let Some(event) = iced_winit::conversion::window_event(
+                    &event, window.scale_factor(),
+                    modifiers) { gui_state.queue_event(event); }
             }
+            Event::MainEventsCleared => {
+                // If there are events pending
+                if !gui_state.is_queue_empty() {
+                    // We update iced
+                    gui_state.update(
+                        viewport.logical_size(),
+                        conversion::cursor_position(
+                            cursor_position, viewport.scale_factor(),
+                        ),
+                        &mut renderer, &iced_wgpu::Theme::Dark,
+                        &renderer::Style { text_color: Color::WHITE },
+                        &mut clipboard, &mut debug,
+                    );
+
+                    // and request a redraw
+                    window.request_redraw();
+                }
+            }
+            Event::RedrawRequested(_) => {
+                if resized {
+                    let size = window.inner_size();
+                    scene.set_aspect_ratio(size.width as f32 / size.height as f32);
+
+                    surface.configure(
+                        &device, &wgpu::SurfaceConfiguration {
+                            format, usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                            width: size.width, height: size.height,
+                            present_mode: wgpu::PresentMode::AutoVsync,
+                        },
+                    );
+
+                    resized = false;
+                }
+
+                match surface.get_current_texture() {
+                    Ok(frame) => {
+                        // Update the scene with values from the controls.
+                        scene.set_max_iterations(gui_state.program().max_iterations());
+                        
+                        let c_freq = gui_state.program().rgb_freq();
+                        scene.set_red_freq(c_freq.r);
+                        scene.set_green_freq(c_freq.g);
+                        scene.set_blue_freq(c_freq.b);
+
+                        let c_phase = gui_state.program().rgb_phase();
+                        scene.set_red_phase(c_phase.r);
+                        scene.set_green_phase(c_phase.g);
+                        scene.set_blue_phase(c_phase.b);
+
+                        let mut encoder = device.create_command_encoder(
+                            &wgpu::CommandEncoderDescriptor { label: None },
+                        );
+
+                        let view = frame.texture.create_view(
+                            &wgpu::TextureViewDescriptor::default()
+                        );
+
+                       // Draw the scene
+                       scene.draw(&queue, &view, &mut encoder);
+
+                        // And then iced on top
+                        renderer.with_primitives(|backend, primitive| {
+                            backend.present(
+                                &device, &mut staging_belt, &mut encoder,
+                                &view, primitive, &viewport, &debug.overlay(),
+                            );
+                        });
+
+                        // Then we submit the work
+                        staging_belt.finish();
+                        queue.submit(Some(encoder.finish()));
+                        frame.present();
+
+                        // Update the mouse cursor
+                         window.set_cursor_icon(
+                             iced_winit::conversion::mouse_interaction(
+                                gui_state.mouse_interaction(),
+                             ),
+                         );
+
+                        // And recall staging buffers
+                        staging_belt.recall();
+                    }
+                    Err(error) => match error {
+                        wgpu::SurfaceError::OutOfMemory => {
+                            panic!("Swapchain error: {}. Rendering cannot continue.", error)
+                        }
+                        _ => {
+                            // Try rendering again next frame.
+                            window.request_redraw();
+                        }
+                    },
+                }
+            }
+            _ => {}
         }
-    }
+    })
 }

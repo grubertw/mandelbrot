@@ -1,9 +1,11 @@
 [package]
 name = "mandelbrot"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["grubertw <grubertw@gmail.com>"]
+edition = "2021"
 
 [dependencies]
-glium="0.16.0"
-log="0.3.0"
+iced_winit= {path = "../iced/winit"}
+iced_wgpu= {path = "../iced/wgpu"}
+bytemuck="1.10.0"
 time="0.1.0"
