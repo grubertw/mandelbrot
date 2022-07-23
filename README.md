@@ -22,3 +22,6 @@ Here are the examples/tutorials I followed to help me write this (2.0) version o
 https://github.com/iced-rs/iced/tree/master/examples/integration_wgpu
 
 https://sotrh.github.io/learn-wgpu/#what-is-wgpu
+
+# Screenshots
+![Mandelbrot 2.0 800x600 - screenshot 1](Mandelbrot_2_ss1.png)
