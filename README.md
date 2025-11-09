@@ -4,8 +4,6 @@ Impementation of Mandelbrot fractal using Rust's Iced GUI Library.
 I try to get fancy by creating an 'overlay' of widets on top the fractal, similar to how controls are overlayed within a graphics engine. This is accomplished using Iced's underlying iced_winit and iced_wgpu.
 
 ## To compile:
-Currently, the released versions of iced_winit and iced_wgpu are dependant on an older version of wgpu, and therefor do not match with a lot of the current online tutorials. So, before building this program, it is requried to use git to checkout iced into a directory becide where mandelbrot is checked out. It is NOT required to build iced, as this project points to paths inside of iced (i.e. path=../iced is used in Cargo.toml). Once that is done, the standard steps can be followed:
-
 $> cargo build
 
 ## To build and run:
@@ -19,7 +17,10 @@ For maximum color diversity, the phases for each color should be shifted by a fa
 ### Other sitations and tributes:
 Here are the examples/tutorials I followed to help me write this (2.0) version of Mandelbrot:
 
-https://github.com/iced-rs/iced/tree/master/examples/integration_wgpu
+https://github.com/iced-rs/iced/tree/0.13.1/examples/integration
+
+
+NOTE: As with all exaples in Git, make sure to view the correct code that has been tagged with the correct release of Iced. Also note, Iced seems to be good at keeping breaking changes from accouring within incremental releases; i.e. all iced_* libs in the 0.13.x series should be compatible. Using a never verion of wgpu might be possible, but only if it's API updates are compatible with iced_wgpu; so it's probably not a good idea.
 
 https://sotrh.github.io/learn-wgpu/#what-is-wgpu
 

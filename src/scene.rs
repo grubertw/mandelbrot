@@ -52,6 +52,7 @@ struct SceneUniform {
     green_phase: f32,
 }
 
+#[derive(Debug)]
 pub struct Scene {
     num_verticies: u32,
     vertex_buffer: wgpu::Buffer,
@@ -62,10 +63,7 @@ pub struct Scene {
 }
 
 impl Scene {
-    pub fn new(
-        device: &wgpu::Device,
-        texture_format: wgpu::TextureFormat,
-    ) -> Self {
+    pub fn new(device: &wgpu::Device, texture_format: wgpu::TextureFormat) -> Scene {
         let num_verticies = VERTICES.len() as u32;
 
         let uniform = SceneUniform {
@@ -85,31 +83,30 @@ impl Scene {
         let (vertex_buffer, uniform_buffer, bind_group, pipeline) = 
             build_pipeline(device, uniform, texture_format);
 
-        Self { num_verticies, vertex_buffer, uniform, uniform_buffer, bind_group, pipeline }
+        Scene { num_verticies, vertex_buffer, uniform, uniform_buffer, bind_group, pipeline }
     }
 
-    pub fn draw(
-        &self, 
-        queue: &wgpu::Queue, 
-        target: &wgpu::TextureView, 
-        encoder: &mut wgpu::CommandEncoder
-    ) {
-        // Uniforms must be updated on every draw operation.
-        queue.write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[self.uniform]));
-
-        let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+    pub fn clear<'a>(target: &'a wgpu::TextureView, encoder: &'a mut wgpu::CommandEncoder) 
+            -> wgpu::RenderPass<'a> {
+        encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: None,
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: target,
                 resolve_target: None,
                 ops: wgpu::Operations {
                     load: wgpu::LoadOp::Clear(wgpu::Color {r: 0.0, g: 0.0, b: 0.0, a: 0.0}),
-                    store: true,
+                    store: wgpu::StoreOp::Store,
                 },
             })],
             depth_stencil_attachment: None,
-        });
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        })
+    }
 
+    pub fn draw<'a>(&'a self, queue: &wgpu::Queue, render_pass: &mut wgpu::RenderPass<'a>) {
+        // Uniforms must be updated on every draw operation.
+        queue.write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[self.uniform]));
 
         render_pass.set_pipeline(&self.pipeline);
         render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
@@ -136,28 +133,20 @@ impl Scene {
         self.uniform.offset_y = y_offset;
     }
 
-    pub fn set_red_freq(&mut self, r_freq: f32) {
-        self.uniform.red_freq = r_freq;
+    pub fn set_rgb_freq(&mut self, rgb_val: (f32, f32, f32)) {
+        let (r, g, b) = rgb_val;
+
+        self.uniform.red_freq = r;
+        self.uniform.green_freq = g;
+        self.uniform.blue_freq = b;
     }
 
-    pub fn set_green_freq(&mut self, g_freq: f32) {
-        self.uniform.green_freq = g_freq;
-    }
+    pub fn set_rgb_phase(&mut self, rgb_val: (f32, f32, f32)) {
+        let (r, g, b) = rgb_val;
 
-    pub fn set_blue_freq(&mut self, b_freq: f32) {
-        self.uniform.blue_freq = b_freq;
-    }
-
-    pub fn set_red_phase(&mut self, r_phase: f32) {
-        self.uniform.red_phase = r_phase;
-    }
-
-    pub fn set_green_phase(&mut self, g_phase: f32) {
-        self.uniform.green_phase = g_phase;
-    }
-
-    pub fn set_blue_phase(&mut self, b_phase: f32) {
-        self.uniform.blue_phase = b_phase;
+        self.uniform.red_phase = r;
+        self.uniform.green_phase = g;
+        self.uniform.blue_phase = b;
     }
 }
 
@@ -170,13 +159,11 @@ fn build_pipeline(
     let shader = device.create_shader_module(wgpu::include_wgsl!("mandelbrot.wgsl"));
 
     // Use a Vertex buffer (and not a shader)
-    let vertex_buffer = device.create_buffer_init(
-        &wgpu::util::BufferInitDescriptor {
-            label: Some("Vertex Buffer"),
-            contents: bytemuck::cast_slice(VERTICES),
-            usage: wgpu::BufferUsages::VERTEX,
-        }
-    );
+    let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("Vertex Buffer"),
+        contents: bytemuck::cast_slice(VERTICES),
+        usage: wgpu::BufferUsages::VERTEX,
+    });
 
     // Setup the Uniform into a buffer so it can be shared and seen by the shader
     let uniform_buff = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -214,14 +201,11 @@ fn build_pipeline(
         label: None
     });
 
-    let pipeline_layout =
-        device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: None,
-            push_constant_ranges: &[],
-            bind_group_layouts: &[
-                &bind_group_layout
-            ],
-        });
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: None,
+        push_constant_ranges: &[],
+        bind_group_layouts: &[&bind_group_layout],
+    });
 
     let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: None,
@@ -247,6 +231,7 @@ fn build_pipeline(
         }),
         primitive: wgpu::PrimitiveState {
             topology: wgpu::PrimitiveTopology::TriangleStrip,
+            front_face: wgpu::FrontFace::Ccw,
             ..Default::default()
         },
         depth_stencil: None,
@@ -255,7 +240,7 @@ fn build_pipeline(
             mask: !0,
             alpha_to_coverage_enabled: false,
         },
-        multiview: None,
+        multiview: None
     });
 
     (vertex_buffer, uniform_buff, bind_group, pipeline)
