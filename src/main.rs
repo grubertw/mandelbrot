@@ -2,12 +2,14 @@ mod controls;
 mod scene;
 
 use controls::Controls;
+use controls::Message;
 use scene::Scene;
 
 use iced_wgpu::graphics::Viewport;
 use iced_wgpu::{Engine, Renderer, wgpu};
 use iced_winit::Clipboard;
 use iced_winit::conversion;
+use iced_winit::core::event;
 use iced_winit::core::mouse;
 use iced_winit::core::renderer;
 use iced_winit::core::{Font, Pixels, Size, Theme, Color};
@@ -24,9 +26,12 @@ use winit::{
     window::{Window, WindowId, WindowAttributes},
 };
 
+use log::{debug, error, info, trace};
+
 use std::rc::Rc;
 use std::cell::RefCell;
 use std::sync::Arc;
+use std::process;
 
 #[allow(clippy::large_enum_variant)]
 enum Runner {
@@ -49,21 +54,25 @@ enum Runner {
         resized: bool,
         // For tracking mouse movment and shifting (offsetting) the fractal
         prev_pos: (f64, f64),
-        mouse_state: ElementState,
+        mouse_lb_state: ElementState,
+        mouse_rb_state: ElementState,
     },
 }
 
 impl ApplicationHandler for Runner {
     fn resumed(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
+        debug!("Runner.resumed");
         if let Self::Loading = self {
             let window = Arc::new(event_loop.create_window(
-                            WindowAttributes::default())
-                            .expect("Create window"));
+                WindowAttributes::default()).unwrap_or_else(|e| {
+                    error!("Failed to Create window .. {}", e);
+                    process::exit(1);
+                }));
 
             let physical_size = window.inner_size();
             let viewport = Viewport::with_physical_size(
                 Size::new(physical_size.width, physical_size.height),
-                window.scale_factor() as f64);
+                window.scale_factor() as f64);            
 
             let clipboard = Clipboard::connect(window.clone());
             let backend = wgpu::util::backend_bits_from_env().unwrap_or_default();
@@ -74,6 +83,9 @@ impl ApplicationHandler for Runner {
             let surface = instance
                 .create_surface(window.clone())
                 .expect("Create window surface");
+
+            debug!("Runner.resumed - physical_size={:?} scale_fac={:?} backend={:?}", 
+                physical_size, window.scale_factor(), backend);
 
             let (format, adapter, device, queue) =
                 futures::futures::executor::block_on(async {
@@ -97,18 +109,22 @@ impl ApplicationHandler for Runner {
                             .expect("Get preferred format"),
                         adapter, device, queue)
                 });
+            debug!("Runner.resumed - format={:?} adapter={:?} device={:?} queue={:?}",
+                format, adapter, device, queue);
 
             surface.configure(&device, &wgpu::SurfaceConfiguration {
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT, format,
                 width: physical_size.width,
                 height: physical_size.height,
-                present_mode: wgpu::PresentMode::AutoVsync,
+                present_mode: wgpu::PresentMode::Fifo,
                 alpha_mode: wgpu::CompositeAlphaMode::Auto,
                 view_formats: vec![],
                 desired_maximum_frame_latency: 2});
 
             // Initialize scene and GUI controls
-            let scene = Rc::new(RefCell::new(Scene::new(&device, format)));
+            let scene = Rc::new(RefCell::new(Scene::new(&device, format, 
+                physical_size.width as f32, 
+                physical_size.height as f32)));
             let controls = Controls::new(Rc::clone(&scene));
 
             // Initialize iced
@@ -121,11 +137,13 @@ impl ApplicationHandler for Runner {
             event_loop.set_control_flow(ControlFlow::Wait);
             
             let prev_pos = (-1.0, -1.0);
-            let mouse_state = ElementState::Released;
+            let mouse_lb_state = ElementState::Released;
+            let mouse_rb_state = ElementState::Released;
 
+            info!("ApplicationHandler Runner Initialized");
             *self = Self::Ready {window, device, queue, surface, format, engine, renderer, debug, 
                 scene: Rc::clone(&scene), state, cursor_position: None, modifiers: ModifiersState::default(),
-                clipboard, viewport, resized: false, prev_pos, mouse_state};
+                clipboard, viewport, resized: false, prev_pos, mouse_lb_state, mouse_rb_state};
         }
     }
 
@@ -133,20 +151,24 @@ impl ApplicationHandler for Runner {
             _window_id: WindowId, event: WindowEvent) {
         let Self::Ready {window, device, queue, surface, format, engine, renderer, debug, scene, 
             state, viewport, cursor_position, modifiers, clipboard, resized, 
-            mouse_state, prev_pos} = self
+            mouse_lb_state, mouse_rb_state, prev_pos} = self
         else {
             return;
         };
-        //println!("Runner.window_event - {:?} {:?}", _window_id, event);
+        trace!("Runner.window_event - {:?} {:?}", _window_id, event);
         
         match event {
             WindowEvent::RedrawRequested => {
                 if *resized {
                     let size = window.inner_size();
-                    scene.borrow_mut().set_aspect_ratio(size.width as f32 / size.height as f32);
+                    scene.borrow_mut().set_window_size(
+                        size.width as f32, 
+                        size.height as f32);
 
-                    *viewport = Viewport::with_physical_size(
-                        Size::new(size.width, size.height),
+                    state.queue_message(Message::UpdateDebugText(
+                        format!("Window Resized ---> w={} h={}", size.width, size.height)));
+
+                    *viewport = Viewport::with_physical_size(Size::new(size.width, size.height),
                         window.scale_factor() as f64);
 
                     surface.configure(device, &wgpu::SurfaceConfiguration {
@@ -178,12 +200,16 @@ impl ApplicationHandler for Runner {
 
                             // Draw the scene
                             s.draw(&queue, &mut render_pass);
+
+                            s.read_debug(&device, &queue);
                         }
 
                         // Draw Iced on top
                         renderer.present(engine, &device, &queue, &mut encoder, 
                             None, frame.texture.format(), &view, viewport, &debug.overlay());
                         engine.submit(queue, encoder);
+
+                        //debug!("draw frame={:?}", frame);
                         frame.present();
 
                         // Update the mouse cursor
@@ -204,20 +230,20 @@ impl ApplicationHandler for Runner {
             WindowEvent::CursorMoved { position, .. } => {
                 *cursor_position = Some(position);
 
-                match mouse_state {
+                match mouse_rb_state {
                     ElementState::Pressed => {
                         if prev_pos.0 > 0.0 {
-                            let h = window.inner_size().height;
+                            let diff = ((position.x - prev_pos.0) as f64,
+                                        (position.y - prev_pos.1) as f64);
 
-                            let diff_x = (position.x - prev_pos.0) / h as f64;
-                            let diff_y = (position.y - prev_pos.1) / h as f64;
+                            debug!("CursorMoved & ElementState::Pressed prev_pos={:?} new_pos={:?} diff={:?}", 
+                                prev_pos, position, diff);
 
-                            let curr_offset = scene.borrow().offset();
-                            let curr_scale = scene.borrow().scale();
-                            scene.borrow_mut().set_offset(
-                                curr_offset.0 - diff_x as f32 * curr_scale,
-                                curr_offset.1 + diff_y as f32 * curr_scale
-                            )
+                            let new_c = scene.borrow_mut().set_center(diff);
+                            state.queue_message(Message::UpdateDebugText(
+                                format!("Complex center Updated ---> {}", new_c)));
+                        } else {
+                            debug!("CursorMoved & ElementState::Pressed starting pos={:?}", position);
                         }
 
                         prev_pos.0 = position.x;
@@ -230,19 +256,23 @@ impl ApplicationHandler for Runner {
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 if let MouseScrollDelta::LineDelta(_, h) = delta {
-                    let curr_scale = scene.borrow().scale();
-                    let new_scale = if h > 0.0 {
-                        curr_scale / 1.05
-                    }
-                    else {
-                        curr_scale * 1.05
-                    };
-                    scene.borrow_mut().set_scale(new_scale);
+                    let new_scale = scene.borrow_mut().change_scale(if h > 0.0 {true} else {false});
+
+                    debug!("MouseWheel & MouseScrollDelta::LineDelta ---> h={} scale={}", 
+                        h, new_scale);
+                    state.queue_message(Message::UpdateDebugText(
+                        format!("Scale Updated ---> {}", new_scale)));
                 }
             }
             WindowEvent::MouseInput { state, button, ..} => {
-                if let MouseButton::Right = button {
-                    *mouse_state = state;
+                match button {
+                    MouseButton::Left => {
+                        *mouse_lb_state = state;
+                    }
+                    MouseButton::Right => {
+                        *mouse_rb_state = state;
+                    }
+                    _ => {}
                 }
             }
             WindowEvent::ModifiersChanged(new_modifiers) => {
@@ -257,14 +287,30 @@ impl ApplicationHandler for Runner {
             _ => {}
         }
 
-        // Map window event to iced event
-        if let Some(event) = conversion::window_event(event,
-            window.scale_factor(), *modifiers) {
-            state.queue_event(event);
+        // Map window event to iced event, and filter mouse movements when no mouse
+        // buttons are preseed 
+        if let Some(event) = conversion::window_event(event, window.scale_factor(), *modifiers) {
+            let mut queue_event = true;
+
+            if let event::Event::Mouse(me) = event {
+                if let mouse::Event::CursorMoved{..} = me {
+                    if   *mouse_lb_state == ElementState::Released 
+                      || *mouse_lb_state == ElementState::Released {
+                        queue_event = false;
+                    }
+                }
+            }
+
+            if queue_event {
+                debug!("Queing window event={:?}", event);
+                state.queue_event(event);
+            }
         }
 
         // If there are events pending
         if !state.is_queue_empty() {
+            debug!{"State Q is not empty, so requesting redraw"};
+
             // We update iced
             let _ = state.update(viewport.logical_size(), cursor_position
                     .map(|p| {conversion::cursor_position(p,viewport.scale_factor())})
@@ -280,9 +326,13 @@ impl ApplicationHandler for Runner {
 }
 
 pub fn main() -> Result<(), winit::error::EventLoopError> {
+    env_logger::init();
+
     // Initialize winit
     let event_loop = EventLoop::new().expect("Opening winit Event Loop");
     let mut runner = Runner::Loading;
+
+    info!("Starting Winit event loop");
 
     // Run the event loop forever
     event_loop.run_app(&mut runner)
