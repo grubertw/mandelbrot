@@ -47,14 +47,16 @@ struct SceneUniform {
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 struct DebugOut {
-    zx_lo: f32,
     zx_hi: f32,
+    zx_lo: f32,
     zy_hi: f32,
     zy_lo: f32,
     cr_hi: f32,
     cr_lo: f32,
     ci_hi: f32,
     ci_lo: f32,
+    ax: f32,
+    ay: f32,
     pix_dx_hi: f32,
     pix_dx_lo: f32,
     pix_dy_hi: f32,
@@ -192,9 +194,15 @@ impl Scene {
                 let data = buffer_slice.get_mapped_range();
                 let dbg = bytemuck::from_bytes::<DebugOut>(&data[..]).clone();
 
-                debug!("GPU DEBUG:");
+                debug!("FROM CPU (scene uniform):");
+                debug!("  c_ref = ({}, {}) ({}, {})", self.uniform.center_x_hi, self.uniform.center_x_lo, self.uniform.center_y_hi, self.uniform.center_y_lo);
+                debug!("  pix_dx = ({}, {})", self.uniform.pix_dx_hi, self.uniform.pix_dx_lo);
+                debug!("  pix_dy = ({}, {})", self.uniform.pix_dy_hi, self.uniform.pix_dy_lo);
+                debug!("FROM GPU (via readback buffer):");
                 debug!("  zx = ({}, {})", dbg.zx_hi, dbg.zx_lo);
                 debug!("  zy = ({}, {})", dbg.zy_hi, dbg.zy_lo);
+                debug!("  ax = {}", dbg.ax);
+                debug!("  ay = {}", dbg.ay);
                 debug!("  c  = ({}, {})  ({}, {})", dbg.cr_hi, dbg.cr_lo, dbg.ci_hi, dbg.ci_lo);
                 debug!("  pix_dx = ({}, {})", dbg.pix_dx_hi, dbg.pix_dx_lo);
                 debug!("  pix_dy = ({}, {})", dbg.pix_dy_hi, dbg.pix_dy_lo);

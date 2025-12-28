@@ -7,6 +7,8 @@ struct DebugOut {
     cr_lo: f32,
     ci_hi: f32,
     ci_lo: f32,
+    ax: f32,
+    ay: f32,
     pix_dx_hi: f32,
     pix_dx_lo: f32,
     pix_dy_hi: f32,
@@ -44,21 +46,33 @@ fn renorm(a_hi: f32, a_lo: f32) -> Df {
 // -------------------------------
 // Double-float addition: a + b
 // -------------------------------
+// Dekker/Knuth
+//fn df_add(a: Df, b: Df) -> Df {
+//    let s = a.hi + b.hi;
+//    let v = s - a.hi;
+//    let err = (a.hi - (s - v)) + (b.hi - v) + a.lo + b.lo;
+//    return renorm(s, err);
+//}
 fn df_add(a: Df, b: Df) -> Df {
     let s = a.hi + b.hi;
-    let v = s - a.hi;
-    let err = (a.hi - (s - v)) + (b.hi - v) + a.lo + b.lo;
-    return renorm(s, err);
+    let e = (a.hi - s) + b.hi + a.lo + b.lo;
+    return Df(s, e);
 }
 
 // -------------------------------
 // Double-float subtraction: a - b
 // -------------------------------
+// Dekker/Knuth
+//fn df_sub(a: Df, b: Df) -> Df {
+//    let s = a.hi - b.hi;
+//    let v = s - a.hi;
+//    let err = (a.hi - (s - v)) - (b.hi + v) + a.lo - b.lo;
+//    return renorm(s, err);
+//}
 fn df_sub(a: Df, b: Df) -> Df {
     let s = a.hi - b.hi;
-    let v = s - a.hi;
-    let err = (a.hi - (s - v)) - (b.hi + v) + a.lo - b.lo;
-    return renorm(s, err);
+    let e = (a.hi - s) - b.hi + a.lo - b.lo;
+    return Df(s, e);
 }
 
 // Split a float into high and low parts for Dekker multiplication.
@@ -76,23 +90,30 @@ fn split_f32(a: f32) -> vec2<f32> {
 // Double-float multiply: a * b
 // Improved df_mul using Dekker splitting for the hi*hi product error compensation.
 // -------------------------------
+// Dekker/Knuth
+//fn df_mul(a: Df, b: Df) -> Df {
+//    let p = a.hi * b.hi;
+//
+//    // Split hi parts
+//    let sa = split_f32(a.hi);
+//    let sb = split_f32(b.hi);
+//    let ahi = sa.x; let alo = sa.y;
+//    let bhi = sb.x; let blo = sb.y;
+//
+//    // Dekker-style error terms
+//    let err1 = ((ahi * bhi) - p) + (ahi * blo) + (alo * bhi);
+//    let err2 = alo * blo;
+//    let cross = (a.hi * b.lo) + (a.lo * b.hi);
+//    let err = err1 + err2 + cross + (a.lo * b.lo);
+//
+//    return renorm(p, err);
+//}
 fn df_mul(a: Df, b: Df) -> Df {
     let p = a.hi * b.hi;
-
-    // Split hi parts
-    let sa = split_f32(a.hi);
-    let sb = split_f32(b.hi);
-    let ahi = sa.x; let alo = sa.y;
-    let bhi = sb.x; let blo = sb.y;
-
-    // Dekker-style error terms
-    let err1 = ((ahi * bhi) - p) + (ahi * blo) + (alo * bhi);
-    let err2 = alo * blo;
-    let cross = (a.hi * b.lo) + (a.lo * b.hi);
-    let err = err1 + err2 + cross + (a.lo * b.lo);
-
-    return renorm(p, err);
+    let e = a.hi * b.lo + a.lo * b.hi;
+    return Df(p, e);
 }
+
 
 fn df_neg(a: Df) -> Df {
     var out: Df;
@@ -126,8 +147,14 @@ fn df_mul_f32(a: Df, b: f32) -> Df {
     return df_mul(a, bdf);
 }
 
-fn df_to_f32(a: Df) -> f32 {
-    return a.hi + a.lo;
+//fn df_to_f32(a: Df) -> f32 {
+//    return a.hi + a.lo;
+//}
+
+fn df_mag2_upper(zx: Df, zy: Df) -> f32 {
+    let ax = abs(zx.hi) + abs(zx.lo);
+    let ay = abs(zy.hi) + abs(zy.lo);
+    return ax * ax + ay * ay;
 }
 
 // -------------------------------
@@ -249,27 +276,11 @@ fn mandelbrot_df(c: ComplexDf, coords: vec4<f32>) -> u32 {
         zx = real_part;
         zy = imag_part;
 
-        // ---------- bailout check ----------
-        // Fast hi-only magnitude test with generous margin:
-        // use hi parts to avoid doing dd-work for obviously escaped points
-        let hi_mag: f32 = zx.hi * zx.hi + zy.hi * zy.hi;
-        if (hi_mag > 16.0) {
+        // Bailout
+        let mag2 = df_mag2_upper(zx, zy);
+        if (mag2 > 16.0) {
             break;
         }
-
-        // Otherwise compute the full double-double magnitude d = zx^2 + zy^2
-        // (we already computed zx2/zy2 for earlier z; recompute here for the updated zx/zy)
-        let zx2_bail = df_mul(zx, zx);
-        let zy2_bail = df_mul(zy, zy);
-        let d = df_add(zx2_bail, zy2_bail);
-
-        //if (d.hi > 4.0) { break; }
-        //else if (d.hi < 4.0 - 1e-6) { /* definitely inside */ } 
-        //else {
-            // when d is very close to 4.0, check d.hi + d.lo precisely:
-        if (df_to_f32(d) > 4.0) { break; }
-        //}
-        // ---------- end bailout ----------
 
         i = i + 1u;
         if (i >= max_i) { break; }
@@ -285,6 +296,9 @@ fn mandelbrot_df(c: ComplexDf, coords: vec4<f32>) -> u32 {
         debug_out.cr_lo = c.r.lo;
         debug_out.ci_hi = c.i.hi;
         debug_out.ci_lo = c.i.lo;
+
+        debug_out.ax = abs(zx.hi) + abs(zx.lo);
+        debug_out.ay = abs(zy.hi) + abs(zy.lo);
 
         debug_out.pix_dx_hi = uni.pix_dx_hi;
         debug_out.pix_dx_lo = uni.pix_dx_lo;

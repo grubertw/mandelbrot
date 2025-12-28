@@ -20,8 +20,8 @@ use iced_winit::winit;
 
 use winit::{
     application::ApplicationHandler,
-    keyboard::ModifiersState,
-    event::{WindowEvent, MouseScrollDelta, ElementState, MouseButton},
+    keyboard::{ModifiersState, PhysicalKey, KeyCode},
+    event::{WindowEvent, KeyEvent, MouseScrollDelta, ElementState, MouseButton},
     event_loop::{ControlFlow, EventLoop, ActiveEventLoop},
     window::{Window, WindowId, WindowAttributes},
 };
@@ -274,6 +274,29 @@ impl ApplicationHandler for Runner {
                     }
                     _ => {}
                 }
+            }
+            WindowEvent::KeyboardInput { device_id: _, ref event, .. } => {
+                let KeyEvent{physical_key, ..} = event;
+                let PhysicalKey::Code (c) = physical_key else {
+                    return;
+                };
+                let new_scale: String;
+                
+                match c {
+                    KeyCode::ArrowUp => {
+                        new_scale = scene.borrow_mut().change_scale(true);
+                    }
+                    KeyCode::ArrowDown => {
+                        new_scale = scene.borrow_mut().change_scale(false);
+                    }
+                    _ => {
+                        new_scale = "".to_string();
+                    }
+                }
+
+                debug!("Arrow Key Pressed! new scale={}", new_scale);
+                    state.queue_message(Message::UpdateDebugText(
+                        format!("Scale Updated ---> {}", new_scale)));
             }
             WindowEvent::ModifiersChanged(new_modifiers) => {
                 *modifiers = new_modifiers.state();
