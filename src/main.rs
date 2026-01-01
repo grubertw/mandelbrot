@@ -1,6 +1,15 @@
 mod controls;
 mod scene;
 
+#[allow(dead_code)]
+mod numerics;
+
+#[allow(dead_code)]
+mod signals;
+
+#[allow(dead_code)]
+mod scout_engine;
+
 use controls::Controls;
 use controls::Message;
 use scene::Scene;
@@ -13,7 +22,7 @@ use iced_winit::core::event;
 use iced_winit::core::mouse;
 use iced_winit::core::renderer;
 use iced_winit::core::{Font, Pixels, Size, Theme, Color};
-use iced_winit::futures;
+use futures::executor;
 use iced_winit::runtime::program;
 use iced_winit::runtime::Debug;
 use iced_winit::winit;
@@ -88,7 +97,7 @@ impl ApplicationHandler for Runner {
                 physical_size, window.scale_factor(), backend);
 
             let (format, adapter, device, queue) =
-                futures::futures::executor::block_on(async {
+                executor::block_on(async {
                     let adapter = wgpu::util::initialize_adapter_from_env_or_default(
                                     &instance, Some(&surface))
                         .await
@@ -123,8 +132,8 @@ impl ApplicationHandler for Runner {
 
             // Initialize scene and GUI controls
             let scene = Rc::new(RefCell::new(Scene::new(&device, format, 
-                physical_size.width as f32, 
-                physical_size.height as f32)));
+                physical_size.width.into(), 
+                physical_size.height.into())));
             let controls = Controls::new(Rc::clone(&scene));
 
             // Initialize iced
@@ -162,8 +171,8 @@ impl ApplicationHandler for Runner {
                 if *resized {
                     let size = window.inner_size();
                     scene.borrow_mut().set_window_size(
-                        size.width as f32, 
-                        size.height as f32);
+                        size.width.into(), 
+                        size.height.into());
 
                     state.queue_message(Message::UpdateDebugText(
                         format!("Window Resized ---> w={} h={}", size.width, size.height)));
@@ -201,6 +210,7 @@ impl ApplicationHandler for Runner {
                             // Draw the scene
                             s.draw(&queue, &mut render_pass);
 
+                            s.read_gpu_feedback(&device, &queue);
                             s.read_debug(&device, &queue);
                         }
 

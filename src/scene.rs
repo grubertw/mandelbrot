@@ -1,6 +1,9 @@
 use bytemuck;
 
-use iced_winit::futures::futures;
+use super::numerics::{Df, ComplexDf};
+
+use futures::channel;
+use futures::executor;
 use iced_wgpu::wgpu;
 use iced_wgpu::wgpu::BufferAsyncError;
 use wgpu::util::DeviceExt;
@@ -9,16 +12,6 @@ use rug::{Float, Complex};
 use log::{trace, debug};
 use std::mem::size_of;
 
-fn split_mpfr_to_df(x: &Float) -> (f32, f32) {
-    let hi = x.to_f64();
-
-    // residual = x - hi
-    let mut residual = Float::with_val(200, x);
-    residual -= hi;
-
-    let lo = residual.to_f64();
-    (hi as f32, lo as f32)
-}
 
 #[repr(C)]
 #[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
@@ -36,13 +29,19 @@ struct SceneUniform {
     width:       f32,
     height:      f32,
     max_iter:    u32,
-    red_freq:    f32,
-    blue_freq:   f32,
-    green_freq:  f32,
-    red_phase:   f32,
-    blue_phase:  f32,
-    green_phase: f32,
 }
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+struct GpuFeedbackOut {
+    max_lambda_hi:  f32,
+    max_lambda_lo:  f32,
+    max_delta_z_hi: f32,
+    max_delta_z_lo: f32,
+    escape_ratio:   f32,
+}
+unsafe impl bytemuck::Pod for GpuFeedbackOut {}
+unsafe impl bytemuck::Zeroable for GpuFeedbackOut {}
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -55,8 +54,8 @@ struct DebugOut {
     cr_lo: f32,
     ci_hi: f32,
     ci_lo: f32,
-    ax: f32,
-    ay: f32,
+    ax:    f32,
+    ay:    f32,
     pix_dx_hi: f32,
     pix_dx_lo: f32,
     pix_dy_hi: f32,
@@ -70,11 +69,16 @@ pub struct Scene {
     scale: Float,
     scale_factor: Float,
     center: Complex, // scaled and shifted with mouse drag
-    width: Float,
-    height: Float,
+    width: f64,
+    height: f64,
+    pix_dx: Float,
+    pix_dy: Float,
     uniform: SceneUniform,
     uniform_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
+    gpu_feedback_buffer: wgpu::Buffer,
+    gpu_feedback_readback: wgpu::Buffer,
+    gpu_feedback_bind_group: wgpu::BindGroup,
     debug_buffer: wgpu::Buffer,
     debug_readback: wgpu::Buffer,
     debug_bind_group: wgpu::BindGroup,
@@ -84,51 +88,41 @@ pub struct Scene {
 impl Scene {
     pub fn new(device: &wgpu::Device, 
         texture_format: wgpu::TextureFormat,
-        width: f32, height: f32,
+        width: f64, height: f64,
     ) -> Scene {
-        let c = Complex::with_val(80, (-0.75, 0.0));
-        let cxdf = split_mpfr_to_df(&c.real());
-        let cydf = split_mpfr_to_df(&c.imag());
-        let w = Float::with_val(80, width);
-        let h = Float::with_val(80, height);
-        let scale = Float::with_val(80, 3.5);
-        let scale_df = split_mpfr_to_df(&scale);
+        let center = Complex::with_val(80, (-0.75, 0.0));
+        let c_df = ComplexDf::from_complex(&center);
 
-        let pix_dx = Float::with_val(200, &scale / &w);
-        let pix_dy = Float::with_val(200, &scale / &h);
-        let pix_dx_df = split_mpfr_to_df(&pix_dx);
-        let pix_dy_df = split_mpfr_to_df(&pix_dy);
+        let scale = Float::with_val(80, 3.5);
+        let scale_df = Df::from_float(&scale);
+
+        let pix_dx = Float::with_val(200, &scale / width);
+        let pix_dy = Float::with_val(200, &scale / height);
+        let pix_dx_df = Df::from_float(&pix_dx);
+        let pix_dy_df = Df::from_float(&pix_dy);
 
         let uniform = SceneUniform {
-            center_x_hi: cxdf.0,
-            center_x_lo: cxdf.1,
-            center_y_hi: cydf.0,
-            center_y_lo: cydf.1,
-            scale_hi:    scale_df.0,
-            scale_lo:    scale_df.1,
-            pix_dx_hi:   pix_dx_df.0,
-            pix_dx_lo:   pix_dx_df.1,
-            pix_dy_hi:   pix_dy_df.0,
-            pix_dy_lo:   pix_dy_df.1,
-            width,
-            height,
+            center_x_hi: c_df.re.hi, center_x_lo: c_df.re.lo,
+            center_y_hi: c_df.im.hi, center_y_lo: c_df.im.lo,
+            scale_hi:    scale_df.hi, scale_lo:    scale_df.lo,
+            pix_dx_hi:   pix_dx_df.hi, pix_dx_lo:   pix_dx_df.lo,
+            pix_dy_hi:   pix_dy_df.hi, pix_dy_lo:   pix_dy_df.lo,
+            width: width as f32, 
+            height: height as f32,
             max_iter:    500,
-            red_freq:    1.0,
-            blue_freq:   1.0,
-            green_freq:  1.0,
-            red_phase:   0.0,
-            blue_phase:  0.0,
-            green_phase: 0.0,
         };
 
-        let (uniform_buffer, bind_group, debug_buffer, debug_readback, debug_bind_group, pipeline) = 
-            build_pipeline(device, uniform, texture_format);
+        let (uniform_buffer, bind_group, 
+            gpu_feedback_buffer, gpu_feedback_readback, gpu_feedback_bind_group,
+            debug_buffer, debug_readback, debug_bind_group, pipeline) = 
+                build_pipeline(device, uniform, texture_format);
 
         Scene { 
             scale, scale_factor: Float::with_val(80, 1.04),
-            center: c, width: w, height: h,
-            uniform, 
-            uniform_buffer, bind_group, debug_buffer, debug_readback, debug_bind_group, pipeline 
+            center, width, height, pix_dx, pix_dy,
+            uniform, uniform_buffer, bind_group, 
+            gpu_feedback_buffer, gpu_feedback_readback, gpu_feedback_bind_group,
+            debug_buffer, debug_readback, debug_bind_group, pipeline 
         }
     }
 
@@ -159,8 +153,51 @@ impl Scene {
 
         render_pass.set_pipeline(&self.pipeline);
         render_pass.set_bind_group(0, &self.bind_group, &[]);
-        render_pass.set_bind_group(1, &self.debug_bind_group, &[]);
+        render_pass.set_bind_group(1, &self.gpu_feedback_bind_group, &[]);
+        render_pass.set_bind_group(2, &self.debug_bind_group, &[]);
         render_pass.draw(0..3, 0..1);
+    }
+
+    pub fn read_gpu_feedback<'a>(&'a self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        // 1) create encoder, copy storage -> readback
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("gpu feedback copy encoder"),
+        });
+
+        encoder.copy_buffer_to_buffer(
+            &self.gpu_feedback_buffer, // src
+            0,
+            &self.gpu_feedback_readback, // dst
+            0,
+            std::mem::size_of::<GpuFeedbackOut>() as u64,
+        );
+
+        // submit the copy
+        queue.submit(Some(encoder.finish()));
+
+        let buffer_slice = self.gpu_feedback_readback.slice(..);
+
+        let (sender, receiver) = channel::oneshot::channel::<Result<(), BufferAsyncError>>();
+        buffer_slice.map_async(wgpu::MapMode::Read, move |v| {
+            sender.send(v).unwrap();
+        });
+
+        device.poll(wgpu::Maintain::Wait);
+
+        executor::block_on(async {
+            if let Ok(Ok(_)) = receiver.await {
+                let data = buffer_slice.get_mapped_range();
+                let dbg = bytemuck::from_bytes::<GpuFeedbackOut>(&data[..]).clone();
+
+                debug!("FROM GPU (via GPU feedback buffer):");
+                debug!("  max_lambda = ({}, {})", dbg.max_lambda_hi, dbg.max_lambda_lo);
+                debug!("  max_delta_z = ({}, {})", dbg.max_delta_z_hi, dbg.max_delta_z_lo);
+                debug!("  escape_ratio = {}", dbg.escape_ratio);
+                
+                drop(data);
+                self.gpu_feedback_readback.unmap();
+            }
+        });
     }
 
     pub fn read_debug<'a>(&'a self, device: &wgpu::Device, queue: &wgpu::Queue) {
@@ -182,14 +219,14 @@ impl Scene {
 
         let buffer_slice = self.debug_readback.slice(..);
 
-        let (sender, receiver) = futures::channel::oneshot::channel::<Result<(), BufferAsyncError>>();
+        let (sender, receiver) = channel::oneshot::channel::<Result<(), BufferAsyncError>>();
         buffer_slice.map_async(wgpu::MapMode::Read, move |v| {
             sender.send(v).unwrap();
         });
 
         device.poll(wgpu::Maintain::Wait);
 
-        futures::executor::block_on(async {
+        executor::block_on(async {
             if let Ok(Ok(_)) = receiver.await {
                 let data = buffer_slice.get_mapped_range();
                 let dbg = bytemuck::from_bytes::<DebugOut>(&data[..]).clone();
@@ -198,7 +235,7 @@ impl Scene {
                 debug!("  c_ref = ({}, {}) ({}, {})", self.uniform.center_x_hi, self.uniform.center_x_lo, self.uniform.center_y_hi, self.uniform.center_y_lo);
                 debug!("  pix_dx = ({}, {})", self.uniform.pix_dx_hi, self.uniform.pix_dx_lo);
                 debug!("  pix_dy = ({}, {})", self.uniform.pix_dy_hi, self.uniform.pix_dy_lo);
-                debug!("FROM GPU (via readback buffer):");
+                debug!("FROM GPU (via debug buffer):");
                 debug!("  zx = ({}, {})", dbg.zx_hi, dbg.zx_lo);
                 debug!("  zy = ({}, {})", dbg.zy_hi, dbg.zy_lo);
                 debug!("  ax = {}", dbg.ax);
@@ -218,9 +255,11 @@ impl Scene {
         self.uniform.max_iter = max_iterations;
     }
 
-    pub fn set_window_size(&mut self, width: f32, height: f32) {
-        self.uniform.width = width;
-        self.uniform.height = height;
+    pub fn set_window_size(&mut self, width: f64, height: f64) {
+        self.width = width;
+        self.height = height;
+        self.uniform.width = width as f32;
+        self.uniform.height = height as f32;
 
         debug!("Window size changed w={} h={}", width, height);
     }
@@ -232,44 +271,41 @@ impl Scene {
             self.scale /= &self.scale_factor;
         }
 
-        let scale_df = split_mpfr_to_df(&self.scale);
-        self.uniform.scale_hi = scale_df.0;
-        self.uniform.scale_lo = scale_df.1;
+        let scale_df = Df::from_float(&self.scale);
+        self.uniform.scale_hi = scale_df.hi;
+        self.uniform.scale_lo = scale_df.lo;
         
-        let pix_dx = Float::with_val(200, &self.scale / &self.width);
-        let pix_dy = Float::with_val(200, &self.scale / &self.height);
+        self.pix_dx = self.scale.clone() / self.width;
+        self.pix_dy = self.scale.clone() / self.height;
 
-        let pix_dx_df = split_mpfr_to_df(&pix_dx);
-        let pix_dy_df = split_mpfr_to_df(&pix_dy);
+        let pix_dx_df = Df::from_float(&self.pix_dx);
+        let pix_dy_df = Df::from_float(&self.pix_dy);
 
-        self.uniform.pix_dx_hi = pix_dx_df.0;
-        self.uniform.pix_dx_lo = pix_dx_df.1;
-        self.uniform.pix_dy_hi = pix_dy_df.0;
-        self.uniform.pix_dy_lo = pix_dy_df.1;
+        self.uniform.pix_dx_hi = pix_dx_df.hi;
+        self.uniform.pix_dx_lo = pix_dx_df.lo;
+        self.uniform.pix_dy_hi = pix_dy_df.hi;
+        self.uniform.pix_dy_lo = pix_dy_df.lo;
 
         let s = self.scale.to_string_radix(10, None);
-        debug!("Scale changed {}", s);
+        let s_pix_dx = self.pix_dx.to_string_radix(10, None);
+        let s_pix_dy = self.pix_dy.to_string_radix(10, None);
+        debug!("Scale changed {} --- pix_dx={} pix_dy={}", s, s_pix_dx, s_pix_dy);
         s
     }
 
     pub fn set_center(&mut self, center_diff: (f64, f64)) -> String {
-        let dx = Float::with_val(200, center_diff.0);
-        let dy = Float::with_val(200, center_diff.1);
-
-        let dx = dx * Float::with_val(200, &self.scale / &self.width);
-        let dy = dy * Float::with_val(200, &self.scale / &self.height);
+        let dx = self.pix_dx.clone() * center_diff.0;
+        let dy = self.pix_dy.clone() * center_diff.1;
 
         let (real, imag) = self.center.as_mut_real_imag();
         *real -= &dx;
         *imag -= &dy;
 
-        let center_x_df = split_mpfr_to_df(&real);
-        let center_y_df = split_mpfr_to_df(&imag);
-
-        self.uniform.center_x_hi = center_x_df.0;
-        self.uniform.center_x_lo = center_x_df.1;
-        self.uniform.center_y_hi = center_y_df.0;
-        self.uniform.center_y_lo = center_y_df.1;
+        let center_df = ComplexDf::from_complex(&self.center);
+        self.uniform.center_x_hi = center_df.re.hi;
+        self.uniform.center_x_lo = center_df.re.lo;
+        self.uniform.center_y_hi = center_df.im.hi;
+        self.uniform.center_y_lo = center_df.im.lo;
 
         let c = self.center.to_string_radix(10, None);
         debug!("Center changed {:?} ----- diff ({:?} {:?})", 
@@ -278,28 +314,16 @@ impl Scene {
         c
     }
 
-    pub fn set_rgb_freq(&mut self, rgb_val: (f32, f32, f32)) {
-        let (r, g, b) = rgb_val;
-
-        self.uniform.red_freq = r;
-        self.uniform.green_freq = g;
-        self.uniform.blue_freq = b;
-    }
-
-    pub fn set_rgb_phase(&mut self, rgb_val: (f32, f32, f32)) {
-        let (r, g, b) = rgb_val;
-
-        self.uniform.red_phase = r;
-        self.uniform.green_phase = g;
-        self.uniform.blue_phase = b;
-    }
 }
 
 fn build_pipeline(
     device: &wgpu::Device,
     uniform: SceneUniform,
     texture_format: wgpu::TextureFormat,
-) -> (wgpu::Buffer, wgpu::BindGroup, wgpu::Buffer, wgpu::Buffer, wgpu::BindGroup, wgpu::RenderPipeline) {
+) -> (wgpu::Buffer, wgpu::BindGroup, // Scene Unifom 
+      wgpu::Buffer, wgpu::Buffer, wgpu::BindGroup, // Gpu Feedback Buffers
+      wgpu::Buffer, wgpu::Buffer, wgpu::BindGroup, // Debug Buffers
+      wgpu::RenderPipeline) {
     // Compile the shader
     let shader = device.create_shader_module(wgpu::include_wgsl!("mandelbrot.wgsl"));
 
@@ -310,7 +334,9 @@ fn build_pipeline(
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
     });
 
-    // Layout the Uniform in graphics memory
+    ///////////////////////////////////////////////////////
+    // Scene Uniform Pipeline configuration
+    ///////////////////////////////////////////////////////
     let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         entries: &[
             wgpu::BindGroupLayoutEntry {
@@ -327,7 +353,6 @@ fn build_pipeline(
         label: None
     });
 
-    // Create bind group for the uniform
     let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
         layout: &bind_group_layout,
         entries: &[
@@ -339,6 +364,56 @@ fn build_pipeline(
         label: None
     });
 
+    ///////////////////////////////////////////////////////
+    // Gpu Feedback Pipeline configuration
+    ///////////////////////////////////////////////////////
+    let gpu_feedback_size = std::mem::size_of::<GpuFeedbackOut>() as u64;
+
+    let gpu_feedback_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("gpu_feedback_buffer"),
+        size: gpu_feedback_size,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+
+    let gpu_feedback_readback = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("gpu_feedback_readback"),
+        size: gpu_feedback_size,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    let gpu_feedback_bind_group_layout =
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("gpu feedback bind group layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }
+            ],
+        });
+
+    let gpu_feedback_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("gpu feedback bind group"),
+        layout: &gpu_feedback_bind_group_layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: gpu_feedback_buffer.as_entire_binding(),
+            }
+        ]
+    });
+
+    ///////////////////////////////////////////////////////
+    // Debug Pipeline configuration
+    ///////////////////////////////////////////////////////
     let debug_size = std::mem::size_of::<DebugOut>() as u64;
 
     let debug_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -354,7 +429,6 @@ fn build_pipeline(
         usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
-
 
     let debug_bind_group_layout =
         device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -384,12 +458,21 @@ fn build_pipeline(
         ]
     });
  
+    ///////////////////////////////////////////////////////
+    // Combign into one uniform pipeline layout
+    ///////////////////////////////////////////////////////
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: None,
         push_constant_ranges: &[],
-        bind_group_layouts: &[&bind_group_layout, &debug_bind_group_layout],
+        bind_group_layouts: 
+            &[&bind_group_layout, 
+              &gpu_feedback_bind_group_layout, 
+              &debug_bind_group_layout],
     });
 
+    ///////////////////////////////////////////////////////
+    // Create Vertex and Fragment Shaders 
+    ///////////////////////////////////////////////////////
     let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: None,
         layout: Some(&pipeline_layout),
@@ -413,5 +496,8 @@ fn build_pipeline(
         multiview: None
     });
 
-    (uniform_buff, bind_group, debug_buffer, debug_readback, debug_bind_group, pipeline)
+    (uniform_buff, bind_group, 
+        gpu_feedback_buffer, gpu_feedback_readback, gpu_feedback_bind_group,
+        debug_buffer, debug_readback, debug_bind_group, 
+        pipeline)
 }

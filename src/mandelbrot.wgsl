@@ -15,7 +15,7 @@ struct DebugOut {
     pix_dy_lo: f32,
 };
 
-@group(1) @binding(0)
+@group(2) @binding(0)
 var<storage, read_write> debug_out: DebugOut;
 
 // -------------------------------
@@ -32,82 +32,20 @@ struct ComplexDf {
 };
 
 // -------------------------------
-// Utility: renormalize a double-double (hi, lo) pair
-// ensure hi contains the high part, lo contains residual
+// Double-float arithmatic operations
 // -------------------------------
-fn renorm(a_hi: f32, a_lo: f32) -> Df {
-    let s = a_hi + a_lo;
-    var out: Df;
-    out.hi = s;
-    out.lo = a_lo - (s - a_hi);
-    return out;
-}
-
-// -------------------------------
-// Double-float addition: a + b
-// -------------------------------
-// Dekker/Knuth
-//fn df_add(a: Df, b: Df) -> Df {
-//    let s = a.hi + b.hi;
-//    let v = s - a.hi;
-//    let err = (a.hi - (s - v)) + (b.hi - v) + a.lo + b.lo;
-//    return renorm(s, err);
-//}
 fn df_add(a: Df, b: Df) -> Df {
     let s = a.hi + b.hi;
     let e = (a.hi - s) + b.hi + a.lo + b.lo;
     return Df(s, e);
 }
 
-// -------------------------------
-// Double-float subtraction: a - b
-// -------------------------------
-// Dekker/Knuth
-//fn df_sub(a: Df, b: Df) -> Df {
-//    let s = a.hi - b.hi;
-//    let v = s - a.hi;
-//    let err = (a.hi - (s - v)) - (b.hi + v) + a.lo - b.lo;
-//    return renorm(s, err);
-//}
 fn df_sub(a: Df, b: Df) -> Df {
     let s = a.hi - b.hi;
     let e = (a.hi - s) - b.hi + a.lo - b.lo;
     return Df(s, e);
 }
 
-// Split a float into high and low parts for Dekker multiplication.
-// For float32 the recommended splitter is 8193.0 (2^13 + 1) to split 24-bit mantissa.
-fn split_f32(a: f32) -> vec2<f32> {
-    let splitter: f32 = 8193.0;
-    let c = splitter * a;
-    let abig = c - (c - a);
-    let ahi = abig;
-    let alo = a - ahi;
-    return vec2<f32>(ahi, alo);
-}
-
-// -------------------------------
-// Double-float multiply: a * b
-// Improved df_mul using Dekker splitting for the hi*hi product error compensation.
-// -------------------------------
-// Dekker/Knuth
-//fn df_mul(a: Df, b: Df) -> Df {
-//    let p = a.hi * b.hi;
-//
-//    // Split hi parts
-//    let sa = split_f32(a.hi);
-//    let sb = split_f32(b.hi);
-//    let ahi = sa.x; let alo = sa.y;
-//    let bhi = sb.x; let blo = sb.y;
-//
-//    // Dekker-style error terms
-//    let err1 = ((ahi * bhi) - p) + (ahi * blo) + (alo * bhi);
-//    let err2 = alo * blo;
-//    let cross = (a.hi * b.lo) + (a.lo * b.hi);
-//    let err = err1 + err2 + cross + (a.lo * b.lo);
-//
-//    return renorm(p, err);
-//}
 fn df_mul(a: Df, b: Df) -> Df {
     let p = a.hi * b.hi;
     let e = a.hi * b.lo + a.lo * b.hi;
@@ -126,30 +64,18 @@ fn df_neg(a: Df) -> Df {
 // Convert a regular f32 into a Df (lo = 0.0)
 // -------------------------------
 fn df_from_f32(x: f32) -> Df {
-    var out: Df;
-    out.hi = x;
-    out.lo = 0.0;
-    return out;
+    return Df(x, 0.0);
 }
 
 fn df_from_i32(i: i32) -> Df {
-    var out: Df;
-    out.hi = f32(i);
-    out.lo = 0.0;
-    return out;
+    return Df(f32(i), 0.0);
 }
 
+// multiply Df by scalar f32
 fn df_mul_f32(a: Df, b: f32) -> Df {
-    // multiply Df by scalar f32
-    var bdf: Df;
-    bdf.hi = b;
-    bdf.lo = 0.0;
-    return df_mul(a, bdf);
+    return df_mul(a, Df(b, 0.0));
 }
 
-//fn df_to_f32(a: Df) -> f32 {
-//    return a.hi + a.lo;
-//}
 
 fn df_mag2_upper(zx: Df, zy: Df) -> f32 {
     let ax = abs(zx.hi) + abs(zx.lo);
@@ -206,16 +132,17 @@ struct Uniforms {
     width:          f32,
     height:         f32,
     max_iter:       u32,
-    red_freq:       f32,
-    blue_freq:      f32,
-    green_freq:     f32,
-    red_phase:      f32,
-    blue_phase:     f32,
-    green_phase:    f32,
 };
-
 @group(0) @binding(0) var<uniform> uni: Uniforms;
 
+struct GpuFeedback {
+    max_lambda_hi:  f32,
+    max_lambda_lo:  f32,
+    max_delta_z_hi: f32,
+    max_delta_z_lo: f32,
+    escape_ratio:   f32,
+};
+@group(1) @binding(0) var<storage, read_write> gpu_fb: GpuFeedback;
 
 // ---------- Build c from integer pixel offsets using CPU-provided pix_dx/pix_dy ----------
 fn build_c_from_frag(coords: vec4<f32>) -> ComplexDf {
