@@ -1,5 +1,6 @@
 use super::numerics::{Df, ComplexDf};
 
+use std::hash::{Hash, Hasher};
 use std::time;
 
 use rug::{Float, Complex};
@@ -38,11 +39,26 @@ pub struct FrameDiagnostics {
 // Produced by Scout Engine
 ///////////////////////////////////////////////////////////
 #[derive(Clone, Debug)]
-pub struct ReferenceSelection {
+pub struct ReferenceOrbitDf {
     pub c_ref: ComplexDf,
     pub orbit: Vec<ComplexDf>,
-    pub max_iterations: u32,
+    pub escape_index: Option<u32>,
+    pub creation_time: time::Instant,
 }
+
+impl Hash for ReferenceOrbitDf {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.creation_time.hash(state);
+    }
+}
+
+impl PartialEq for ReferenceOrbitDf {
+    fn eq(&self, other: &Self) -> bool {
+        self.creation_time == other.creation_time
+    }
+}
+
+impl Eq for ReferenceOrbitDf {}
 
 #[derive(Clone, Debug)]
 pub struct ScoutDiagnostics {

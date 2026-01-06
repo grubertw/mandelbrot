@@ -131,9 +131,13 @@ impl ApplicationHandler for Runner {
                 desired_maximum_frame_latency: 2});
 
             // Initialize scene and GUI controls
-            let scene = Rc::new(RefCell::new(Scene::new(&device, format, 
+            let scene = Rc::new(RefCell::new(Scene::new(window.clone(), &device, format, 
                 physical_size.width.into(), 
                 physical_size.height.into())));
+            // Take a snapshot of where the camera is in the beginning to send to ScoutEngine
+            // So that an initial reference orbit can be computed.
+            scene.borrow_mut().take_camera_snapshot();
+            
             let controls = Controls::new(Rc::clone(&scene));
 
             // Initialize iced
@@ -202,15 +206,20 @@ impl ApplicationHandler for Runner {
                             &wgpu::TextureViewDescriptor::default());
 
                         {
-                            let s = scene.borrow_mut();
+                            let mut s = scene.borrow_mut();
 
                             // Clear the frame
                             let mut render_pass = Scene::clear(&view, &mut encoder);
+                            s.stamp_frame();
+
+                            // Ask for the best reference orbits ScoutEngine has 
+                            // at the moment and push to GPU here.
+                            s.query_best_reference_orbits(queue);
 
                             // Draw the scene
                             s.draw(&queue, &mut render_pass);
 
-                            s.read_gpu_feedback(&device, &queue);
+                            //s.read_gpu_feedback(&device, &queue);
                             s.read_debug(&device, &queue);
                         }
 
@@ -260,6 +269,10 @@ impl ApplicationHandler for Runner {
                         prev_pos.1 = position.y;
                     }
                     ElementState::Released => {
+                        if prev_pos.0 > 0.0 {
+                            scene.borrow_mut().take_camera_snapshot();
+                        }
+
                         *prev_pos = (-1.0, -1.0);
                     }
                 }
@@ -267,6 +280,7 @@ impl ApplicationHandler for Runner {
             WindowEvent::MouseWheel { delta, .. } => {
                 if let MouseScrollDelta::LineDelta(_, h) = delta {
                     let new_scale = scene.borrow_mut().change_scale(if h > 0.0 {true} else {false});
+                    scene.borrow_mut().take_camera_snapshot();
 
                     debug!("MouseWheel & MouseScrollDelta::LineDelta ---> h={} scale={}", 
                         h, new_scale);
