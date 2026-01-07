@@ -273,17 +273,22 @@ impl Scene {
                 let data = buffer_slice.get_mapped_range();
                 let dbg = bytemuck::from_bytes::<DebugOut>(&data[..]).clone();
 
+                debug!("FROM CPU (Secne struct)");
+                debug!("  center={:?}", self.center);
+                for a_orb in &self.active_ref_orbits {
+                    debug!("   active orbit c_ref={:?}", a_orb.c_ref);
+                }
                 debug!("FROM CPU (scene uniform):");
                 debug!("  c_ref = ({}, {}) ({}, {})", self.uniform.center_x_hi, self.uniform.center_x_lo, self.uniform.center_y_hi, self.uniform.center_y_lo);
                 debug!("  pix_dx = ({}, {})", self.uniform.pix_dx_hi, self.uniform.pix_dx_lo);
                 debug!("  pix_dy = ({}, {})", self.uniform.pix_dy_hi, self.uniform.pix_dy_lo);
                 debug!("  scale = ({}, {})", self.uniform.scale_hi, self.uniform.scale_lo);
                 debug!("FROM GPU (via debug buffer):");
-                debug!("  c_ref = (({},{}) ({},{}))", dbg.c_ref_re_hi, dbg.c_ref_re_lo, dbg.c_ref_im_hi, dbg.c_ref_im_lo);
-                debug!("  delta_c = (({},{}) ({},{}))", dbg.delta_c_re_hi, dbg.delta_c_re_lo, dbg.delta_c_im_hi, dbg.delta_c_im_lo);
+                debug!("  c_ref   = (({}, {}) ({}, {}))", dbg.c_ref_re_hi, dbg.c_ref_re_lo, dbg.c_ref_im_hi, dbg.c_ref_im_lo);
+                debug!("  delta_c = (({}, {}) ({}, {}))", dbg.delta_c_re_hi, dbg.delta_c_re_lo, dbg.delta_c_im_hi, dbg.delta_c_im_lo);
                 debug!("  perturb_escape_seq = {}", dbg.perturb_escape_seq);
                 debug!("  last_valid_i = {}", dbg.last_valid_i);
-                debug!("  last_valid_z   = ({},{}) ({},{})", dbg.last_valid_z_re_hi, dbg.last_valid_z_re_lo, dbg.last_valid_z_im_hi,dbg.last_valid_z_im_lo);
+                debug!("  last_valid_z = ({},{}) ({},{})", dbg.last_valid_z_re_hi, dbg.last_valid_z_re_lo, dbg.last_valid_z_im_hi,dbg.last_valid_z_im_lo);
     
                 drop(data);
                 self.debug_readback.unmap();

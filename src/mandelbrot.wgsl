@@ -281,20 +281,21 @@ fn mandelbrot_perturb(c: ComplexDf, delta_c: ComplexDf, coords: vec4<f32>) -> ve
 
         // Perturbation validity collapse
         if (df_mag2_upper(dz.r, dz.i) > validity_radius2) {
-            last_valid_i = i;
-            last_valid_z = z;
             esc_seq = 2u;
             break;
         }
 
         i = i + 1u;
+        last_valid_i = i;
+        last_valid_z = z;
+        
         if (i >= max_i) { 
             esc_seq = 3u;
             break; 
         }
     }
 
-    if (esc_seq == 2) {
+    if (esc_seq > 1) {
         // Continue ABSOLUTE from last valid
         i = i + mandelbrot_df_from_z(last_valid_z, c);
     }

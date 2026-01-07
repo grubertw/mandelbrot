@@ -17,7 +17,7 @@ use std::time;
 use std::sync::{Arc, Mutex};
 
 // Maximum size the orbit pool can be before we begin to trim the lowest ranked ones
-const MAX_ORBIT_POOL_SIZE: usize = 100;
+const MAX_ORBIT_POOL_SIZE: usize = 25;
 
 // Common types used throughout the module - mainly between async functions and accross the
 // sync/async barrier
