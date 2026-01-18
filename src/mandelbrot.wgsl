@@ -9,6 +9,7 @@ struct DebugOut {
     delta_c_im_lo: f32,
     perturb_escape_seq: u32,
     last_valid_i: u32,
+    abs_i: u32,
     last_valid_z_re_hi: f32,
     last_valid_z_re_lo: f32,
     last_valid_z_im_hi: f32,
@@ -163,13 +164,18 @@ struct GpuFeedback {
 // Reference orbit from ScoutEngine
 // ----------------------------
 @group(3) @binding(0)
-var<storage, read> ref_orbit_re_hi: array<f32>;
-@group(3) @binding(1)
-var<storage, read> ref_orbit_re_lo: array<f32>;
-@group(3) @binding(2)
-var<storage, read> ref_orbit_im_hi: array<f32>;
-@group(3) @binding(3)
-var<storage, read> ref_orbit_im_lo: array<f32>;
+var ref_orbit_tex : texture_2d<f32>;
+
+fn load_ref_orbit(i: u32) -> ComplexDf {
+    let ix = i32(i);
+    let re_hi = textureLoad(ref_orbit_tex, vec2<i32>(ix, 0), 0).x;
+    let re_lo = textureLoad(ref_orbit_tex, vec2<i32>(ix, 1), 0).x;
+    let im_hi = textureLoad(ref_orbit_tex, vec2<i32>(ix, 2), 0).x;
+    let im_lo = textureLoad(ref_orbit_tex, vec2<i32>(ix, 3), 0).x;
+    return ComplexDf(Df(re_hi, re_lo), Df(im_hi, im_lo));
+}
+
+
 
 // ---------- Build c from integer pixel offsets using CPU-provided pix_dx/pix_dy ----------
 fn build_c_from_frag(coords: vec4<f32>) -> ComplexDf {
@@ -245,7 +251,7 @@ fn mandelbrot_df_from_z(z: ComplexDf, c: ComplexDf) -> u32 {
 const validity_radius2 = 0.01; // or 0.001 to be stricter
 const PERTURB_SCALE_THRESHOLD = 1e-5;
 
-fn mandelbrot_perturb(c: ComplexDf, delta_c: ComplexDf, coords: vec4<f32>) -> vec2<u32> {
+fn mandelbrot_perturb(c: ComplexDf, delta_c: ComplexDf, coords: vec4<f32>) -> vec3<u32> {
     var dz = ComplexDf(df_from_f32(0.0), df_from_f32(0.0));
     var i: u32 = 0u;
     let max_i = uni.max_iter;
@@ -256,13 +262,11 @@ fn mandelbrot_perturb(c: ComplexDf, delta_c: ComplexDf, coords: vec4<f32>) -> ve
     // Track last iteration where perturbation was valid
     var last_valid_i: u32 = 0u;
     var last_valid_z = ComplexDf(df_from_f32(0.0), df_from_f32(0.0));
+    var abs_i: u32 = 0u;
 
     loop {
         // Load reference orbit Z_n
-        let Z = ComplexDf(
-            Df(ref_orbit_re_hi[i], ref_orbit_re_lo[i]),
-            Df(ref_orbit_im_hi[i], ref_orbit_im_lo[i])
-        );
+        let Z = load_ref_orbit(i);
 
         // λ_n = 2 * Z_n
         let lambda = cdf_add(Z, Z);
@@ -297,17 +301,23 @@ fn mandelbrot_perturb(c: ComplexDf, delta_c: ComplexDf, coords: vec4<f32>) -> ve
 
     if (esc_seq > 1) {
         // Continue ABSOLUTE from last valid
-        i = i + mandelbrot_df_from_z(last_valid_z, c);
+        abs_i = mandelbrot_df_from_z(last_valid_z, c); 
+        i = last_valid_i + abs_i;
     }
 
-    debug_out.perturb_escape_seq = esc_seq;
-    debug_out.last_valid_i = last_valid_i;
-    debug_out.last_valid_z_re_hi = last_valid_z.r.hi;
-    debug_out.last_valid_z_re_lo = last_valid_z.r.lo;
-    debug_out.last_valid_z_im_hi = last_valid_z.i.hi;
-    debug_out.last_valid_z_im_lo = last_valid_z.i.lo;
+    let ix: i32 = i32(coords.x);
+    let iy: i32 = i32(coords.y);
+    if (ix == 0 && iy == 0) {
+        debug_out.perturb_escape_seq = esc_seq;
+        debug_out.last_valid_i = last_valid_i;
+        debug_out.abs_i = abs_i;
+        debug_out.last_valid_z_re_hi = last_valid_z.r.hi;
+        debug_out.last_valid_z_re_lo = last_valid_z.r.lo;
+        debug_out.last_valid_z_im_hi = last_valid_z.i.hi;
+        debug_out.last_valid_z_im_lo = last_valid_z.i.lo;
+    }
 
-    return vec2<u32>(i, last_valid_i);
+    return vec3<u32>(i, last_valid_i, abs_i);
 }
 
 
@@ -326,6 +336,8 @@ fn vs_main(@builtin(vertex_index) vid: u32) -> @builtin(position) vec4<f32> {
     return vec4<f32>(pos, 0.0, 1.0);
 }
 
+const K = 0.25;
+
 // -------------------------------
 // Fragment shader
 // -------------------------------
@@ -335,31 +347,48 @@ fn fs_main(@builtin(position) coords: vec4<f32>) -> @location(0) vec4<f32> {
     let c = build_c_from_frag(coords);
     var it: u32 = 0u;
 
-    let c_ref = ComplexDf(
-        Df(uni.center_x_hi, uni.center_x_lo),
-        Df(uni.center_y_hi, uni.center_y_lo)
-    );
+    let c_ref = load_ref_orbit(1u);
+
     let delta_c = cdf_sub(c, c_ref);
 
-    debug_out.c_ref_re_hi = c_ref.r.hi;
-    debug_out.c_ref_re_lo = c_ref.r.lo;
-    debug_out.c_ref_im_hi = c_ref.i.hi;
-    debug_out.c_ref_im_lo = c_ref.i.lo;
-    debug_out.delta_c_re_hi = delta_c.r.hi;
-    debug_out.delta_c_re_lo = delta_c.r.lo;
-    debug_out.delta_c_im_hi = delta_c.i.hi;
-    debug_out.delta_c_im_lo = delta_c.i.lo;
+    let scale = Df(uni.scale_hi, uni.scale_lo);
+    let k_scale = df_mul(scale, df_from_f32(K));
+    let k_scale_f = k_scale.hi + k_scale.lo;
+    let mag_delta_c = abs(delta_c.r.hi) + abs(delta_c.r.lo) + abs(delta_c.i.hi) + abs(delta_c.i.lo);
+
+    let ix: i32 = i32(coords.x);
+    let iy: i32 = i32(coords.y);
+    if (ix == 0 && iy == 0) {
+        debug_out.c_ref_re_hi = c_ref.r.hi;
+        debug_out.c_ref_re_lo = c_ref.r.lo;
+        debug_out.c_ref_im_hi = c_ref.i.hi;
+        debug_out.c_ref_im_lo = c_ref.i.lo;
+        debug_out.delta_c_re_hi = delta_c.r.hi;
+        debug_out.delta_c_re_lo = delta_c.r.lo;
+        debug_out.delta_c_im_hi = delta_c.i.hi;
+        debug_out.delta_c_im_lo = delta_c.i.lo;
+
+        // Reset debug outs that mandelbrot_perturb will later overwrite (if used)
+        debug_out.perturb_escape_seq = 0u;
+        debug_out.last_valid_i = 0u;
+        debug_out.abs_i = 0u;
+        debug_out.last_valid_z_re_hi = 0.0;
+        debug_out.last_valid_z_re_lo = 0.0;
+        debug_out.last_valid_z_im_hi = 0.0;
+        debug_out.last_valid_z_im_lo = 0.0;
+    }
 
     var t: f32 = 0.0;
     var color = vec3<f32>(0.0, 0.0, 0.0);
 
-    if (uni.scale_hi < PERTURB_SCALE_THRESHOLD &&
-        df_mag2_upper(delta_c.r, delta_c.i) < validity_radius2) {
+    if (uni.scale_hi < PERTURB_SCALE_THRESHOLD) {
         let p_res = mandelbrot_perturb(c, delta_c, coords);
         it = p_res.x;
 
-        t = f32(p_res.y) / f32(uni.max_iter);
-        color = vec3<f32>(t, 0.0, 1.0 - t);
+        let pt = f32(p_res.y) / f32(uni.max_iter);
+        let at = f32(p_res.z) / f32(uni.max_iter);
+        let tt = f32(p_res.x) / f32(uni.max_iter);
+        color = vec3<f32>(pt, at, tt);
     }
     else {
         var z = ComplexDf(df_from_f32(0.0), df_from_f32(0.0));
@@ -368,6 +397,9 @@ fn fs_main(@builtin(position) coords: vec4<f32>) -> @location(0) vec4<f32> {
         t = f32(it) / f32(uni.max_iter);
         color = vec3<f32>(t, t*t, pow(t, 0.5));
     }
+
+    //t = f32(it) / f32(uni.max_iter);
+    //color = vec3<f32>(t, t*t, pow(t, 0.5));
 
     if (it == uni.max_iter) {
         // inside set -> black

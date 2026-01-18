@@ -1,4 +1,5 @@
 use super::numerics::{Df, ComplexDf};
+use super::scout_engine::{TileId, TileGeometry};
 
 use std::hash::{Hash, Hasher};
 use std::time;
@@ -39,9 +40,20 @@ pub struct FrameDiagnostics {
 // Produced by Scout Engine
 ///////////////////////////////////////////////////////////
 #[derive(Clone, Debug)]
+pub struct TileOrbitViewDf {
+    pub tile: TileId,
+    pub geometry: TileGeometry,
+    pub orbits: Vec<ReferenceOrbitDf>,
+}
+
+#[derive(Clone, Debug)]
 pub struct ReferenceOrbitDf {
+    pub orbit_id: u64,
     pub c_ref: ComplexDf,
-    pub orbit: Vec<ComplexDf>,
+    pub orbit_re_hi: Vec<f32>,
+    pub orbit_re_lo: Vec<f32>,
+    pub orbit_im_hi: Vec<f32>,
+    pub orbit_im_lo: Vec<f32>,
     pub escape_index: Option<u32>,
     pub creation_time: time::Instant,
 }

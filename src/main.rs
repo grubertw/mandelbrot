@@ -212,9 +212,8 @@ impl ApplicationHandler for Runner {
                             let mut render_pass = Scene::clear(&view, &mut encoder);
                             s.stamp_frame();
 
-                            // Ask for the best reference orbits ScoutEngine has 
-                            // at the moment and push to GPU here.
-                            s.query_best_reference_orbits(queue);
+                            // Ask ScoutEngine for it's current tile orbits and push to the GPU
+                            s.query_tile_orbits(queue);
 
                             // Draw the scene
                             s.draw(&queue, &mut render_pass);
@@ -309,9 +308,11 @@ impl ApplicationHandler for Runner {
                 match c {
                     KeyCode::ArrowUp => {
                         new_scale = scene.borrow_mut().change_scale(true);
+                        scene.borrow_mut().take_camera_snapshot();
                     }
                     KeyCode::ArrowDown => {
                         new_scale = scene.borrow_mut().change_scale(false);
+                        scene.borrow_mut().take_camera_snapshot();
                     }
                     _ => {
                         new_scale = "".to_string();

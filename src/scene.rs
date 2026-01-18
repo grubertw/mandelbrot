@@ -2,7 +2,7 @@ use bytemuck;
 
 use super::numerics::{Df, ComplexDf};
 use super::signals;
-use super::scout_engine::{ScoutConfig, HeuristicConfig, ScoutEngine};
+use super::scout_engine::{ScoutConfig, HeuristicConfig, TileId, TileLevel, ScoutEngine};
 
 use futures::channel;
 use futures::executor;
@@ -13,14 +13,15 @@ use iced_winit::winit::window::Window;
 
 use rug::{Float, Complex};
 use log::{trace, debug};
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::mem::size_of;
 use std::time;
 
 const MAX_REF_ORBIT: u32 = 8192;
 const INIT_RUG_PRECISION: u32 = 128;
-const MAX_NUM_ACTIVE_REF_ORBITS: u32 = 1;
+const K: f32 = 0.25; // Multiplied by scale, and often used as a radius of validity test
+const PERTURB_THRESHOLD: f32 = 1e-5;
 
 #[repr(C)]
 #[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
@@ -70,6 +71,7 @@ struct DebugOut {
     delta_c_im_lo: f32,
     perturb_escape_seq: u32,
     last_valid_i: u32,
+    abs_i: u32,
     last_valid_z_re_hi: f32,
     last_valid_z_re_lo: f32,
     last_valid_z_im_hi: f32,
@@ -77,6 +79,11 @@ struct DebugOut {
 }
 unsafe impl bytemuck::Pod for DebugOut {}
 unsafe impl bytemuck::Zeroable for DebugOut {}
+
+struct OrbitMeta {
+    base_row: u32,
+    orbit_len: u32,
+}
 
 #[derive(Debug)]
 pub struct Scene {
@@ -90,7 +97,7 @@ pub struct Scene {
     pix_dx: Float,
     pix_dy: Float,
     scout_engine: ScoutEngine,
-    active_ref_orbits: HashSet<signals::ReferenceOrbitDf>, 
+    active_tiles: HashMap<TileId, signals::TileOrbitViewDf>,
     uniform: SceneUniform,
     uniform_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
@@ -100,10 +107,7 @@ pub struct Scene {
     debug_buffer: wgpu::Buffer,
     debug_readback: wgpu::Buffer,
     debug_bind_group: wgpu::BindGroup,
-    ref_orbit_re_hi_buffer: wgpu::Buffer,
-    ref_orbit_re_lo_buffer: wgpu::Buffer,
-    ref_orbit_im_hi_buffer: wgpu::Buffer,
-    ref_orbit_im_lo_buffer: wgpu::Buffer,
+    ref_orbit_texture: wgpu::Texture,
     ref_orbit_bind_group: wgpu::BindGroup,
     pipeline: wgpu::RenderPipeline,
 }
@@ -139,7 +143,7 @@ impl Scene {
         let (uniform_buffer, bind_group, 
             gpu_feedback_buffer, gpu_feedback_readback, gpu_feedback_bind_group,
             debug_buffer, debug_readback, debug_bind_group, 
-            ref_orbit_re_hi_buffer, ref_orbit_re_lo_buffer, ref_orbit_im_hi_buffer,ref_orbit_im_lo_buffer, ref_orbit_bind_group,
+            ref_orbit_texture, ref_orbit_bind_group,
             pipeline) = 
                 build_pipeline(device, uniform, texture_format);
 
@@ -151,18 +155,31 @@ impl Scene {
             heuristic_config: HeuristicConfig {
                 weight_1: 0.0
             },
+            tile_levels: vec![
+                //TileLevel {
+                //    level: 0,
+                //    tile_size: Float::with_val(INIT_RUG_PRECISION, K),
+                //    max_orbits_per_tile: 3
+                //},
+                TileLevel {
+                    level: 1,
+                    tile_size: Float::with_val(INIT_RUG_PRECISION, 5.0 * PERTURB_THRESHOLD),
+                    influence_radius_factor: 1.25,
+                    max_orbits_per_tile: 6,
+                },
+            ],
             exploration_budget: 5.0,
         };
 
         let scout_engine = ScoutEngine::new(window, scout_config);
-        let active_ref_orbits = HashSet::<signals::ReferenceOrbitDf>::new();
+        let active_tiles = HashMap::<TileId, signals::TileOrbitViewDf>::new();
 
         Scene { 
             frame_id: 0, frame_timestamp: time::Instant::now(), scale, scale_factor: Float::with_val(80, 1.04),
-            center, width, height, pix_dx, pix_dy, scout_engine, active_ref_orbits,
+            center, width, height, pix_dx, pix_dy, scout_engine, active_tiles,
             uniform, uniform_buffer, bind_group, 
             gpu_feedback_buffer, gpu_feedback_readback, gpu_feedback_bind_group,
-            ref_orbit_re_hi_buffer, ref_orbit_re_lo_buffer, ref_orbit_im_hi_buffer,ref_orbit_im_lo_buffer, ref_orbit_bind_group,
+            ref_orbit_texture, ref_orbit_bind_group,
             debug_buffer, debug_readback, debug_bind_group, pipeline
         }
     }
@@ -275,19 +292,17 @@ impl Scene {
 
                 debug!("FROM CPU (Secne struct)");
                 debug!("  center={:?}", self.center);
-                for a_orb in &self.active_ref_orbits {
-                    debug!("   active orbit c_ref={:?}", a_orb.c_ref);
-                }
+                
                 debug!("FROM CPU (scene uniform):");
-                debug!("  c_ref = ({}, {}) ({}, {})", self.uniform.center_x_hi, self.uniform.center_x_lo, self.uniform.center_y_hi, self.uniform.center_y_lo);
                 debug!("  pix_dx = ({}, {})", self.uniform.pix_dx_hi, self.uniform.pix_dx_lo);
                 debug!("  pix_dy = ({}, {})", self.uniform.pix_dy_hi, self.uniform.pix_dy_lo);
                 debug!("  scale = ({}, {})", self.uniform.scale_hi, self.uniform.scale_lo);
-                debug!("FROM GPU (via debug buffer):");
+                debug!("FROM GPU (via debug buffer at px=0 py=0):");
                 debug!("  c_ref   = (({}, {}) ({}, {}))", dbg.c_ref_re_hi, dbg.c_ref_re_lo, dbg.c_ref_im_hi, dbg.c_ref_im_lo);
                 debug!("  delta_c = (({}, {}) ({}, {}))", dbg.delta_c_re_hi, dbg.delta_c_re_lo, dbg.delta_c_im_hi, dbg.delta_c_im_lo);
                 debug!("  perturb_escape_seq = {}", dbg.perturb_escape_seq);
                 debug!("  last_valid_i = {}", dbg.last_valid_i);
+                debug!("  abs_i = {}", dbg.abs_i);
                 debug!("  last_valid_z = ({},{}) ({},{})", dbg.last_valid_z_re_hi, dbg.last_valid_z_re_lo, dbg.last_valid_z_im_hi,dbg.last_valid_z_im_lo);
     
                 drop(data);
@@ -361,27 +376,48 @@ impl Scene {
         c
     }
 
-    pub fn upload_reference_orbit(&mut self, orbit: &Vec<ComplexDf>, queue: &wgpu::Queue) {
-        debug!("Uploading Reference Orbit of size {} to GPU", orbit.len());
+    pub fn upload_reference_orbit(&mut self, ref_orb_df: signals::ReferenceOrbitDf, queue: &wgpu::Queue) {
+        let ref_orb_len: u32 = ref_orb_df.orbit_re_hi.len() as u32;
+        debug!("Uploading Reference Orbit {} of size {} to GPU. c_ref={:?}", 
+            ref_orb_df.orbit_id, ref_orb_len, ref_orb_df.c_ref);
 
-        let mut re_hi_data = Vec::<f32>::with_capacity(MAX_REF_ORBIT as usize);
-        let mut re_lo_data = Vec::<f32>::with_capacity(MAX_REF_ORBIT as usize);
-        let mut im_hi_data = Vec::<f32>::with_capacity(MAX_REF_ORBIT as usize);
-        let mut im_lo_data = Vec::<f32>::with_capacity(MAX_REF_ORBIT as usize);
+        let mut orbit_texture_data = Vec::<f32>::with_capacity(ref_orb_len as usize * 4);
+        for re_hi in ref_orb_df.orbit_re_hi {
+            orbit_texture_data.push(re_hi);
+        }
+        for re_lo in ref_orb_df.orbit_re_lo {
+            orbit_texture_data.push(re_lo);
+        }
+        for im_hi in ref_orb_df.orbit_im_hi {
+            orbit_texture_data.push(im_hi);
+        }
+        for im_lo in ref_orb_df.orbit_im_lo {
+            orbit_texture_data.push(im_lo);
+        }
 
-        orbit.iter().for_each(|cdf| {
-            re_hi_data.push(cdf.re.hi);
-            re_lo_data.push(cdf.re.lo);
-            im_hi_data.push(cdf.im.hi);
-            im_lo_data.push(cdf.im.lo);
-        });
+        queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &self.ref_orbit_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            bytemuck::cast_slice(&orbit_texture_data),
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(std::num::NonZeroU32::new(
+                    MAX_REF_ORBIT as u32 * std::mem::size_of::<f32>() as u32
+                ).unwrap().into()),
+                rows_per_image: None,
+            },
+            wgpu::Extent3d {
+                width: MAX_REF_ORBIT as u32,
+                height: 4,
+                depth_or_array_layers: 1,
+            },
+        );
 
-        queue.write_buffer(&self.ref_orbit_re_hi_buffer, 0, bytemuck::cast_slice(&re_hi_data));
-        queue.write_buffer(&self.ref_orbit_re_lo_buffer, 0, bytemuck::cast_slice(&re_lo_data));
-        queue.write_buffer(&self.ref_orbit_im_hi_buffer, 0, bytemuck::cast_slice(&im_hi_data));
-        queue.write_buffer(&self.ref_orbit_im_lo_buffer, 0, bytemuck::cast_slice(&im_lo_data));
-
-        self.uniform.ref_len = orbit.len() as u32;
+        self.uniform.ref_len = ref_orb_len;
     }
 
     pub fn stamp_frame(&mut self) {
@@ -402,39 +438,20 @@ impl Scene {
         self.scout_engine.submit_camera_snapshot(cam_snap);
     }
 
-    pub fn query_best_reference_orbits(&mut self, queue: &wgpu::Queue) {
-        // Note, ScoutEngine may return less than the number of reference orbits that
-        // can be active.
-        let best_ref_orbits = self.scout_engine.query_best_orbits(MAX_NUM_ACTIVE_REF_ORBITS);
+    pub fn query_tile_orbits(&mut self, queue: &wgpu::Queue) {        
+        let tiles = self.scout_engine.query_tiles_under_viewport(
+            &self.center, &self.scale, self.width / self.height);
 
-        for best_orb in &best_ref_orbits {
-            if self.active_ref_orbits.contains(&best_orb) {
-                debug!("Orbit c_ref={:?} already active, skipping insertion for now", best_orb.c_ref);
-            }
-            else {
-                debug!("Activating orbit from ScoutEngine at c_ref={:?}", best_orb.c_ref);
-                self.upload_reference_orbit(&best_orb.orbit, queue);
-                self.active_ref_orbits.insert(best_orb.clone());
-            }
+        // Purely for testing only!
+        if tiles.len() == 0 {
+            debug!("Query Tile Orbits found NO tiles!");
+            return;
         }
-
-        // If we've reached the max number of allowed active reference orbits and
-        // we have a full set of best orbits from ScoutEngine, then remove any active
-        // orbits that are no longer considred 'best' by ScoutEngine, this way we can
-        // stay as up-to-date with ScoutEngine's scoring/ranking as possible.
-        if best_ref_orbits.len() == MAX_NUM_ACTIVE_REF_ORBITS as usize
-           && self.active_ref_orbits.len() > MAX_NUM_ACTIVE_REF_ORBITS as usize {
-            let orbs_to_remove = self.active_ref_orbits.iter().fold(
-                Vec::<signals::ReferenceOrbitDf>::new(), |mut acc, orb| {
-                if best_ref_orbits.contains(&orb) == false {
-                    acc.push(orb.clone());
-                }
-                acc
-            });
-            for orb in orbs_to_remove {
-                debug!("Deactivating orbit at c_ref={:?}", orb.c_ref);
-                self.active_ref_orbits.remove(&orb);
-            }
+        let tile_opt = tiles.iter().find(|tile| tile.orbits.len() > 0);
+        if let Some(tile) = tile_opt {
+            debug!("Taking orbit from tile {:?}", tile.tile);
+            let ref_orb_df = &tile.orbits[0];
+            self.upload_reference_orbit(ref_orb_df.clone(), queue);
         }
     }
 }
@@ -446,7 +463,7 @@ fn build_pipeline(
 ) -> (wgpu::Buffer, wgpu::BindGroup, // Scene Unifom 
       wgpu::Buffer, wgpu::Buffer, wgpu::BindGroup, // Gpu Feedback Buffers
       wgpu::Buffer, wgpu::Buffer, wgpu::BindGroup, // Debug Buffers
-      wgpu::Buffer, wgpu::Buffer, wgpu::Buffer, wgpu::Buffer, wgpu::BindGroup, // Reference Orbit Buffers
+      wgpu::Texture, wgpu::BindGroup, // Reference Orbit Texture
       wgpu::RenderPipeline) {
     // Compile the shader
     let shader = device.create_shader_module(wgpu::include_wgsl!("mandelbrot.wgsl"));
@@ -583,77 +600,37 @@ fn build_pipeline(
     });
 
     ///////////////////////////////////////////////////////
-    // Reference Orbit Buffer Pipeline configuration
+    // Reference Orbit Texture (single orbit, step 1)
     ///////////////////////////////////////////////////////
-    let ref_orbit_re_hi_buf = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("ref_orbit_re_hi"),
-        size: (MAX_REF_ORBIT as usize * std::mem::size_of::<f32>()) as u64,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
+    let ref_orbit_texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("ref_orbit_texture"),
+        size: wgpu::Extent3d {
+            width: MAX_REF_ORBIT as u32,
+            height: 4, // re_hi, re_lo, im_hi, im_lo
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::R32Float,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
     });
 
-    let ref_orbit_re_lo_buf = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("ref_orbit_re_lo"),
-        size: (MAX_REF_ORBIT as usize * std::mem::size_of::<f32>()) as u64,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-
-    let ref_orbit_im_hi_buf = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("ref_orbit_im_hi"),
-        size: (MAX_REF_ORBIT as usize * std::mem::size_of::<f32>()) as u64,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-
-    let ref_orbit_im_lo_buf = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("ref_orbit_im_lo"),
-        size: (MAX_REF_ORBIT as usize * std::mem::size_of::<f32>()) as u64,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
+    let ref_orbit_texture_view =
+        ref_orbit_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
     let ref_orbit_bgl = device.create_bind_group_layout(
         &wgpu::BindGroupLayoutDescriptor {
-            label: Some("ref_orbit_bgl"),
+            label: Some("ref_orbit_texture_bgl"),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
                     visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
                     },
                     count: None,
                 },
@@ -662,28 +639,15 @@ fn build_pipeline(
     );
 
     let ref_orbit_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("ref_orbit_bg"),
+        label: Some("ref_orbit_texture_bg"),
         layout: &ref_orbit_bgl,
         entries: &[
             wgpu::BindGroupEntry {
                 binding: 0,
-                resource: ref_orbit_re_hi_buf.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: ref_orbit_re_lo_buf.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: ref_orbit_im_hi_buf.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 3,
-                resource: ref_orbit_im_lo_buf.as_entire_binding(),
+                resource: wgpu::BindingResource::TextureView(&ref_orbit_texture_view),
             },
         ],
     });
-
  
     ///////////////////////////////////////////////////////
     // Combign into one uniform pipeline layout
@@ -727,6 +691,6 @@ fn build_pipeline(
     (uniform_buff, bind_group, 
         gpu_feedback_buffer, gpu_feedback_readback, gpu_feedback_bind_group,
         debug_buffer, debug_readback, debug_bind_group, 
-        ref_orbit_re_hi_buf, ref_orbit_re_lo_buf, ref_orbit_im_hi_buf, ref_orbit_im_lo_buf, ref_orbit_bg,
+        ref_orbit_texture, ref_orbit_bg,
         pipeline)
 }
